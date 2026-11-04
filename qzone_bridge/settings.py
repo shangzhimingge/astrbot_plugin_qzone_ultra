@@ -142,6 +142,7 @@ class PluginSettings:
     pillowmd_style_dir: str = ""
     post_provider_id: str = ""
     persona_id: str = ""
+    context_umo: str = ""
     auto_reply_enabled: bool = False
     auto_reply_poll_interval: int = 120
     auto_reply_delay_min: int = 30
@@ -252,6 +253,7 @@ class PluginSettings:
             pillowmd_style_dir=str(_pick(mapping, "pillowmd_style_dir", "") or ""),
             post_provider_id=str(_nested(mapping, "llm", "post_provider_id", "") or ""),
             persona_id=str(_nested(mapping, "llm", "persona_id", "") or "").strip(),
+            context_umo=str(_nested(mapping, "llm", "context_umo", "") or "").strip(),
             auto_reply_enabled=_as_bool(_nested(mapping, "auto_reply", "enabled", False), False),
             auto_reply_poll_interval=_as_int(_nested(mapping, "auto_reply", "poll_interval", 120), 120, minimum=30, maximum=3600),
             auto_reply_delay_min=_as_int(_nested(mapping, "auto_reply", "delay_min", 30), 30, minimum=0, maximum=3600),

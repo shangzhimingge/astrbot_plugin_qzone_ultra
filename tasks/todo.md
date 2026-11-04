@@ -9,3 +9,5 @@
 - [x] Final full Python/Node checks, compile, diff check, inspect diff and incremental commits.
 - [x] Provide API/button selector contract and fixture QA instructions to root.
 - [ ] Sol final review remains pending; root browser QA passed. Do not push/PR before Sol verification and parent release decision.
+
+- [x] Sol V4 UMO correction: explicit context_umo, unique-instance inference, shared scheduler/persona helper, exact MessageSession tests and full suite (496 passed).

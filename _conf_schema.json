@@ -26,6 +26,12 @@
         "type": "string",
         "default": ""
       },
+      "context_umo": {
+        "description": "定时/Pages AI 草稿使用的 AstrBot 会话标识；留空时仅在唯一 aiocqhttp 实例下从管理群/管理员推导",
+        "type": "string",
+        "default": "",
+        "hint": "格式示例：平台实例ID:GroupMessage:群号 或 平台实例ID:FriendMessage:QQ号。"
+      },
       "post_provider_id": {
         "description": "写说说用的大模型提供商",
         "type": "string",

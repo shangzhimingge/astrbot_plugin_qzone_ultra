@@ -33,26 +33,70 @@ def _value(obj: Any, key: str, default: Any = None) -> Any:
     return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
 
 
-def _synthetic_umo(settings: Any) -> str | None:
+def _validated_umo(value: Any, *, management_chat: bool = True) -> str:
+    value = str(value or "").strip()
+    try:
+        from astrbot.core.platform.message_session import MessageSession
+
+        session = MessageSession.from_str(value)
+        if not session.platform_id or not session.session_id or str(session) != value:
+            raise ValueError("malformed message session")
+        if management_chat and session.message_type.value not in {"GroupMessage", "FriendMessage"}:
+            raise ValueError("unsupported message session")
+    except Exception as exc:
+        raise PersonaResolutionError("llm.context_umo 必须是有效的 AstrBot 群聊或私聊会话标识。") from exc
+    return value
+
+
+def resolve_context_umo(context: Any, settings: Any, event: Any = None) -> str | None:
+    """Return an explicit, event-owned, or unambiguous management-chat UMO."""
+    synthetic = event is None or bool(getattr(event, "_qzone_context_free", False))
+    if not synthetic:
+        umo = getattr(event, "unified_msg_origin", None)
+        return _validated_umo(umo, management_chat=False) if umo else None
+    explicit = str(getattr(settings, "context_umo", "") or "").strip()
+    if explicit:
+        return _validated_umo(explicit)
     group = int(getattr(settings, "manage_group", 0) or 0)
-    if group > 0:
-        return f"aiocqhttp:group:{group}"
-    admins = getattr(settings, "admin_uins", ()) or ()
-    for admin in admins:
-        if str(admin).isdigit() and int(admin) > 0:
-            return f"aiocqhttp:private:{int(admin)}"
-    return None
+    session_id = str(group) if group > 0 else ""
+    message_type = "GroupMessage" if session_id else "FriendMessage"
+    if not session_id:
+        admins = getattr(settings, "admin_uins", ()) or ()
+        session_id = next((str(admin) for admin in admins if str(admin).isdigit() and int(admin) > 0), "")
+    if not session_id:
+        return None
+    manager = getattr(context, "platform_manager", None)
+    getter = getattr(manager, "get_insts", None)
+    instances = getter() if callable(getter) else getattr(manager, "platform_insts", ())
+    matches = []
+    for instance in instances or ():
+        try:
+            meta = instance.meta()
+        except Exception:
+            continue
+        if _value(meta, "name") == "aiocqhttp" and _value(meta, "id"):
+            matches.append(meta)
+    if len(matches) != 1:
+        return None
+    try:
+        from astrbot.core.platform.message_session import MessageSession
+        from astrbot.core.platform.message_type import MessageType
+
+        kind = MessageType.GROUP_MESSAGE if message_type == "GroupMessage" else MessageType.FRIEND_MESSAGE
+        return str(MessageSession(str(_value(matches[0], "id")), kind, session_id))
+    except Exception as exc:
+        raise PersonaResolutionError("无法构造 AstrBot 会话标识。") from exc
 
 
 async def resolve_persona_prompt(context: Any, settings: Any, event: Any) -> str:
     """Return the selected Persona prompt without caching mutable Persona state."""
     synthetic = event is None or bool(getattr(event, "_qzone_context_free", False))
+    umo = resolve_context_umo(context, settings, event)
     manager = getattr(context, "persona_manager", None)
     if manager is None:
         if synthetic and str(getattr(settings, "persona_id", "") or "").strip():
             raise PersonaResolutionError("已配置人格 ID，但当前 AstrBot 未提供人格管理器。")
         return ""
-    umo = getattr(event, "unified_msg_origin", None) if not synthetic else _synthetic_umo(settings)
     override = str(getattr(settings, "persona_id", "") or "").strip()
 
     if synthetic and override:
@@ -84,7 +128,20 @@ async def resolve_persona_prompt(context: Any, settings: Any, event: Any) -> str
     persona = None
     resolved_selection = False
     if callable(resolver) and umo:
-        platform_name = str(umo).split(":", 1)[0]
+        platform_name = ""
+        if not synthetic and callable(getattr(event, "get_platform_name", None)):
+            platform_name = str(event.get_platform_name() or "")
+        if not platform_name:
+            manager = getattr(context, "platform_manager", None)
+            getter = getattr(manager, "get_insts", None)
+            for instance in getter() if callable(getter) else getattr(manager, "platform_insts", ()) or ():
+                try:
+                    meta = instance.meta()
+                except Exception:
+                    continue
+                if str(_value(meta, "id", "")) == str(umo).split(":", 1)[0]:
+                    platform_name = str(_value(meta, "name", "") or "")
+                    break
         try:
             resolved = await _await(resolver(
                 umo=umo,

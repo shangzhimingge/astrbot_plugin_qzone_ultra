@@ -168,6 +168,7 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `llm.comment_provider_id` | 空 | 评论使用的 LLM provider |
 | `llm.reply_provider_id` | 空 | 回评使用的 LLM provider |
 | `llm.persona_id` | 空 | 此 Fork 中仅用于定时/Pages 等无会话上下文生成；留空时沿用 AstrBot 当前选中人格 |
+| `llm.context_umo` | 空 | 定时/Pages 草稿使用的 AstrBot 会话（如 `平台实例ID:GroupMessage:群号` 或 `平台实例ID:FriendMessage:QQ号`）；为空时仅在唯一 aiocqhttp 实例下由管理群/管理员推导，实例缺失或不唯一时使用全局默认上下文，不猜实例。显式 `persona_id` 仍只选择人格，`context_umo` 用于会话/配置上下文；真实消息始终使用消息自身会话 |
 | `auto_reply.enabled` | `false` | 此 Fork 的自说说新增评论自动回复开关；默认关闭 |
 | `auto_reply.poll_interval` | `120` | 自动回评轮询间隔（秒） |
 | `auto_reply.delay_min` / `auto_reply.delay_max` | `30` / `180` | 自动回评发送前随机等待范围（秒） |

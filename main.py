@@ -4280,8 +4280,11 @@ class QzoneStablePlugin(Star):
         return self._clean_life_publish_text(text, fallback=static_caption) or static_caption
 
     def _scheduled_plugin_event(self, *, prompt: str = "") -> Any:
+        from qzone_bridge.persona import resolve_context_umo
+
         sender_id = int((self.settings.admin_uins or [0])[0] or 0)
         group_id = int(getattr(self.settings, "manage_group", 0) or 0)
+        umo = resolve_context_umo(getattr(self, "_context", None), self.settings)
         message_text = str(prompt or "").strip()
         message_obj = SimpleNamespace(
             message=[],
@@ -4298,7 +4301,7 @@ class QzoneStablePlugin(Star):
                 self.sender_id = sender
                 self.user_id = sender
                 self.group_id = group
-                self.unified_msg_origin = f"aiocqhttp:group:{group}" if group else f"aiocqhttp:private:{sender}"
+                self.unified_msg_origin = umo
 
             def get_sender_id(self) -> int:
                 return self.sender_id
