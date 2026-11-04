@@ -143,6 +143,7 @@ class PluginSettings:
     post_provider_id: str = ""
     persona_id: str = ""
     context_umo: str = ""
+    persona_consistency_check: bool = True
     auto_reply_enabled: bool = False
     auto_reply_poll_interval: int = 120
     auto_reply_delay_min: int = 30
@@ -185,6 +186,8 @@ class PluginSettings:
     life_publish_enabled: bool = False
     life_publish_use_life_context: bool = True
     life_publish_use_llm_image_prompt: bool = True
+    life_publish_inherit_persona_visual: bool = True
+    life_publish_persona_visual_prompt: str = ""
     life_publish_use_omnidraw_selfie: bool = True
     life_publish_auto_caption: bool = True
     life_publish_mode: str = "publish"
@@ -254,6 +257,7 @@ class PluginSettings:
             post_provider_id=str(_nested(mapping, "llm", "post_provider_id", "") or ""),
             persona_id=str(_nested(mapping, "llm", "persona_id", "") or "").strip(),
             context_umo=str(_nested(mapping, "llm", "context_umo", "") or "").strip(),
+            persona_consistency_check=_as_bool(_nested(mapping, "llm", "persona_consistency_check", True), True),
             auto_reply_enabled=_as_bool(_nested(mapping, "auto_reply", "enabled", False), False),
             auto_reply_poll_interval=_as_int(_nested(mapping, "auto_reply", "poll_interval", 120), 120, minimum=30, maximum=3600),
             auto_reply_delay_min=_as_int(_nested(mapping, "auto_reply", "delay_min", 30), 30, minimum=0, maximum=3600),
@@ -334,6 +338,12 @@ class PluginSettings:
                 _nested(mapping, "life_publish", "use_llm_image_prompt", True),
                 True,
             ),
+            life_publish_inherit_persona_visual=_as_bool(
+                _nested(mapping, "life_publish", "inherit_persona_visual", True), True
+            ),
+            life_publish_persona_visual_prompt=str(
+                _nested(mapping, "life_publish", "persona_visual_prompt", "") or ""
+            ).strip(),
             life_publish_use_omnidraw_selfie=_as_bool(
                 _nested(mapping, "life_publish", "use_omnidraw_selfie", True),
                 True,

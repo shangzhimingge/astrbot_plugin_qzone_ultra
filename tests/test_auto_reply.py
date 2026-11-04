@@ -393,6 +393,50 @@ def test_llm_failure_is_retryable_then_sends_once(tmp_path):
     asyncio.run(scenario())
 
 
+def test_real_persona_guard_failure_does_not_reserve_or_send_auto_reply(tmp_path):
+    from qzone_bridge.llm import QzoneLLM
+
+    async def scenario():
+        controller = Controller()
+        settings = PluginSettings(persona_id="p", reply_prompt="简短回复", auto_reply_enabled=True)
+        class Manager:
+            async def resolve_selected_persona(self, **kwargs):
+                return "p", {"prompt": "persona prompt"}, None, False
+            async def get_persona_v3_by_id(self, _pid):
+                return {"prompt": "persona prompt"}
+        class Provider:
+            def __init__(self): self.calls = 0
+            async def text_chat(self, *, prompt, contexts, system_prompt):
+                self.calls += 1
+                if prompt.startswith("Review whether"):
+                    return '{"accepted":false,"rewrite":"SENSITIVE_REWRITE"}'
+                return "SENSITIVE_DRAFT"
+        provider = Provider()
+        class Context:
+            persona_manager = Manager()
+            conversation_manager = None
+            platform_manager = None
+            async def get_config(self, umo): return {"provider_settings": {}}
+            async def get_using_provider(self, **kwargs): return provider
+        adapter = QzoneLLM(Context(), settings)
+        svc = service(controller, tmp_path / "guard-state.json")
+        svc.generate_reply = lambda post, comment: adapter.generate_reply_text(None, post, comment)
+        assert await svc.poll_once() == 0  # initial baseline
+        activation = (await svc._account_snapshot(controller.login))["activation_ts"]
+        controller.comments.append({
+            "commentid": "guard-fails", "uin": 20002, "nickname": "Friend",
+            "content": "hello", "date": activation + 1,
+        })
+        assert await svc.poll_once() == 0
+        state = await svc._account_snapshot(controller.login)
+        assert len(controller.sent) == 0
+        records = state["records"]
+        assert provider.calls == 3  # candidate plus two reviews; terminal rejection precedes reservation
+        assert all(record.get("status") == "baseline" for record in records.values())
+        assert not any(record.get("status") in {"reserved", "uncertain", "complete"} for record in records.values())
+    asyncio.run(scenario())
+
+
 def test_stop_during_pre_send_delay_cancels_without_sending(tmp_path, monkeypatch):
     async def scenario():
         controller = Controller()

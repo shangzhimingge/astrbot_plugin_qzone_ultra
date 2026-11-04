@@ -5,6 +5,8 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
+_UNSET_UMO = object()
+
 
 class PersonaResolutionError(ValueError):
     """A configured Persona override cannot be resolved."""
@@ -88,10 +90,12 @@ def resolve_context_umo(context: Any, settings: Any, event: Any = None) -> str |
         raise PersonaResolutionError("无法构造 AstrBot 会话标识。") from exc
 
 
-async def resolve_persona_prompt(context: Any, settings: Any, event: Any) -> str:
+async def resolve_persona_prompt(
+    context: Any, settings: Any, event: Any, *, resolved_umo: str | None | object = _UNSET_UMO
+) -> str:
     """Return the selected Persona prompt without caching mutable Persona state."""
     synthetic = event is None or bool(getattr(event, "_qzone_context_free", False))
-    umo = resolve_context_umo(context, settings, event)
+    umo = resolve_context_umo(context, settings, event) if resolved_umo is _UNSET_UMO else resolved_umo
     manager = getattr(context, "persona_manager", None)
     if manager is None:
         if synthetic and str(getattr(settings, "persona_id", "") or "").strip():

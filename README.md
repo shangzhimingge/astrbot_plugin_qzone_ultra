@@ -10,7 +10,7 @@ QQ空间Ultra 是一个面向 AstrBot 的 QQ 空间插件，提供中文命令�
 
 ## 此 Fork 的增量功能
 
-以下是此 Fork 新增的功能，不代表上游仓库已有同样实现：LLM 文本生成继承 AstrBot 当前选中人格；Pages 中“AI 生成评论/回复”只生成可编辑草稿，不会自动提交；可选的“自动回复自己说说的新评论”默认关闭，启用后首次成功扫描会先为现有评论建立基线，并对发送前再次确认的新增评论执行限额回复。自动回评状态保存在插件数据目录 `auto_reply_state.json`；遇到发送结果不确定时会保留状态并避免自动重发。
+以下是此 Fork 新增的功能，不代表上游仓库已有同样实现：LLM 文本生成继承 AstrBot 当前选中人格，并可在最终文案阶段执行有界一致性复核；Life 图像提示可继承经严格来源片段校验的视觉属性；Pages 中“AI 生成评论/回复”只生成可编辑草稿，不会自动提交；可选的“自动回复自己说说的新评论”默认关闭，启用后首次成功扫描会先为现有评论建立基线，并对发送前再次确认的新增评论执行限额回复。自动回评状态保存在插件数据目录 `auto_reply_state.json`；遇到发送结果不确定时会保留状态并避免自动重发。
 
 ## 亮点：自动发布「会生活」的日常说说
 
@@ -175,6 +175,9 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `llm.reply_provider_id` | 空 | 回评使用的 LLM provider |
 | `llm.persona_id` | 空 | 此 Fork 中仅用于定时/Pages 等无会话上下文生成；留空时沿用 AstrBot 当前选中人格 |
 | `llm.context_umo` | 空 | 定时/Pages 草稿使用的 AstrBot 会话（如 `平台实例ID:GroupMessage:群号` 或 `平台实例ID:FriendMessage:QQ号`）；为空时仅在唯一 aiocqhttp 实例下由管理群/管理员推导，实例缺失或不唯一时使用全局默认上下文，不猜实例。显式 `persona_id` 仍只选择人格，`context_umo` 用于会话/配置上下文；真实消息始终使用消息自身会话 |
+| `llm.persona_consistency_check` | `true` | 有非空选中人格时，对清理/截断后的最终说说、新闻、评论、回复和自动配文执行严格复核；通常额外1次复核，需改写时最多2次，失败则跳过发送。关闭可维持旧行为。每个逻辑操作共享最多6次Provider调用和90秒预算 |
+| `life_publish.inherit_persona_visual` | `true` | Life 图像提示是否继承视觉资料；禁用或选中人格为空/禁用时不提取 |
+| `life_publish.persona_visual_prompt` | 空 | 管理员编写的外观/配饰/服装专用摘要（最多2400字符）；优先于自动片段提取 |
 | `auto_reply.enabled` | `false` | 此 Fork 的自说说新增评论自动回复开关；默认关闭 |
 | `auto_reply.poll_interval` | `120` | 自动回评轮询间隔（秒） |
 | `auto_reply.delay_min` / `auto_reply.delay_max` | `30` / `180` | 自动回评发送前随机等待范围（秒） |
@@ -240,6 +243,8 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 - `life_publish.enabled=true`
 - `life_publish.use_life_context=true`
 - `life_publish.use_llm_image_prompt=true`
+- `life_publish.inherit_persona_visual=true`
+- `life_publish.persona_visual_prompt` 留空时从选中人格提取视觉片段；要精确固定左右侧、发饰等细节，建议由管理员填写视觉专用摘要
 - `life_publish.use_omnidraw_selfie=true`
 - `life_publish.auto_caption=true`
 - `life_publish.mode=publish` 或 `draft`
@@ -249,6 +254,9 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 说明：
 
 - 这里不会调用 OmniDraw 的自动下发路径，只使用 `return_result=true` 取回图片结果。
+- 选中人格默认可为 Life 图片提示提供来源文本中的外观、配饰和特征服装片段；不会把完整人格交给图片提示词。管理员填写 `life_publish.persona_visual_prompt` 后优先使用该视觉专用摘要；该摘要最多2400字符。关闭 `life_publish.inherit_persona_visual` 可禁用继承。自动提取由模型完成，片段校验不能证明语义筛选绝对正确；视觉摘要提供更精确控制，生成图片本身不会被插件视觉验收。
+- 默认启用人格复核后，普通最终文案为生成+复核共2次逻辑调用；如需一次修订则最多3次。非空 Persona、未填写视觉摘要且启用图片提示时，Life 通常为视觉提取1次 + 图片提示1次 + 文案生成/复核2次，共4次；文案需要修订时共5次。填写摘要省去视觉提取。关闭图片 LLM 时不会隐式调用视觉提取；自动配文关闭时仍使用管理员配置的静态文案。
+- 人格提示词注入和复核可改善一致性，但模型输出不保证完全遵循；插件不强制固定口头禅或句尾词。
 - 如果 Life Scheduler 或 OmniDraw 不可用，会按 `failure_policy` 处理。
 - OmniDraw 未返回图片或调用抛错时，会按 `life_publish.image_retry_count` 重试，每次仍强制传 `return_result=true`。
 - 关闭 `life_publish.enabled` 后，`trigger.publish_cron` 会退回原来的纯文本定时发说说。

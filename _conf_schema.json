@@ -127,6 +127,12 @@
         "type": "text",
         "default": "这条帖子收到了一条评论，请自然回复此条评论，不要解释。",
         "hint": "用于 回评/回复评论。"
+      },
+      "persona_consistency_check": {
+        "description": "人格一致性复核",
+        "type": "bool",
+        "default": true,
+        "hint": "选中人格非空时复核最终说说、评论和回复；通常增加1次调用，需修订时最多增加2次。关闭后保留旧行为。"
       }
     }
   },
@@ -332,6 +338,18 @@
         "type": "text",
         "default": "根据今日日程和自拍画面，写一条适合 QQ 空间发布的简短说说。自然、有生活感，不要解释。\\n\\n日程上下文：\\n{life_context}\\n\\n自拍提示词：\\n{image_prompt}",
         "hint": "支持 {life_context} 和 {image_prompt} 占位符。"
+      },
+      "inherit_persona_visual": {
+        "description": "Life 图片提示继承人格视觉特征",
+        "type": "bool",
+        "default": true,
+        "hint": "使用视觉专用摘要或经过原文片段校验的视觉描述；不会把完整人格交给图片提示词。"
+      },
+      "persona_visual_prompt": {
+        "description": "管理员填写的视觉专用人格摘要",
+        "type": "text",
+        "default": "",
+        "hint": "仅填写外观、配饰和特征服装，最多2400字符；左右侧等细节建议明确描述。"
       }
     }
   },

@@ -239,6 +239,97 @@ def test_ai_draft_timeout_covers_context_and_generation_and_releases_slot(monkey
     assert api._ai_generation_slots._value == 2
 
 
+@pytest.mark.parametrize("reply", [False, True])
+def test_real_persona_guard_page_callbacks_return_approved_editable_drafts_only(reply):
+    from qzone_bridge.llm import QzoneLLM
+    from qzone_bridge.settings import PluginSettings
+
+    async def scenario():
+        class Manager:
+            async def resolve_selected_persona(self, **kwargs):
+                return "p", {"prompt": "黑发，左耳银色耳环"}, None, False
+            async def get_persona_v3_by_id(self, _pid):
+                return {"prompt": "黑发，左耳银色耳环"}
+        class Provider:
+            def __init__(self): self.calls = 0
+            async def text_chat(self, *, prompt, contexts, system_prompt):
+                self.calls += 1
+                if prompt.startswith("Review whether"):
+                    return '{"accepted":true,"rewrite":""}'
+                return "这句很贴切。"
+        provider = Provider()
+        class Context:
+            persona_manager = Manager()
+            conversation_manager = None
+            platform_manager = None
+            async def get_config(self, umo): return {"provider_settings": {}}
+            async def get_using_provider(self, **kwargs): return provider
+        adapter = QzoneLLM(Context(), PluginSettings(persona_id="p"))
+        controller = _Controller()
+        api = QzonePageApi(
+            controller=controller, post_service_factory=lambda: None,
+            settings=SimpleNamespace(max_feed_limit=20),
+            ai_comment_generator=lambda post: adapter.generate_comment_text(None, post),
+            ai_reply_generator=lambda post, comment: adapter.generate_reply_text(None, post, comment),
+        )
+        post_id = (await api.feed({}))['data']['items'][0]['id']
+        if reply:
+            result = await api.ai_reply({"id": post_id, "commentid": "comment-1", "comment_uin": 30003})
+        else:
+            result = await api.ai_comment({"id": post_id})
+        assert result["data"]["content"] == "这句很贴切"
+        assert provider.calls == 2
+        assert controller.commented is None
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reply", [False, True])
+def test_real_persona_guard_page_rejection_has_fixed_error_and_no_draft(reply):
+    from qzone_bridge.llm import QzoneLLM
+    from qzone_bridge.settings import PluginSettings
+
+    async def scenario():
+        class Manager:
+            async def resolve_selected_persona(self, **kwargs):
+                return "p", {"prompt": "black hair"}, None, False
+            async def get_persona_v3_by_id(self, _pid):
+                return {"prompt": "black hair"}
+        class Provider:
+            def __init__(self): self.calls = 0
+            async def text_chat(self, *, prompt, contexts, system_prompt):
+                self.calls += 1
+                if prompt.startswith("Review whether"):
+                    return '{"accepted":false,"rewrite":"SENSITIVE_REWRITE"}'
+                return "SENSITIVE_DRAFT"
+        provider = Provider()
+        class Context:
+            persona_manager = Manager()
+            conversation_manager = None
+            platform_manager = None
+            async def get_config(self, umo): return {"provider_settings": {}}
+            async def get_using_provider(self, **kwargs): return provider
+        adapter = QzoneLLM(Context(), PluginSettings(persona_id="p"))
+        controller = _Controller()
+        api = QzonePageApi(
+            controller=controller, post_service_factory=lambda: None,
+            settings=SimpleNamespace(max_feed_limit=20),
+            ai_comment_generator=lambda post: adapter.generate_comment_text(None, post),
+            ai_reply_generator=lambda post, comment: adapter.generate_reply_text(None, post, comment),
+        )
+        post_id = (await api.feed({}))['data']['items'][0]['id']
+        with pytest.raises(QzoneParseError) as caught:
+            if reply:
+                await api.ai_reply({"id": post_id, "commentid": "comment-1", "comment_uin": 30003})
+            else:
+                await api.ai_comment({"id": post_id})
+        payload, _ = page_error_payload(caught.value)
+        assert payload["message"] == "AI 草稿生成失败，请稍后重试。"
+        assert "SENSITIVE" not in str(payload)
+        assert provider.calls == 3  # candidate, first review, and terminal review of the correction
+        assert controller.commented is None
+    asyncio.run(scenario())
+
+
 def test_ai_draft_slot_saturation_returns_busy_instead_of_queueing():
     async def run():
         controller = _Controller()

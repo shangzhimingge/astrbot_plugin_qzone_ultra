@@ -269,14 +269,63 @@ def test_bridge_cache_contract_rejects_missing_llm_persona_flag(monkeypatch: pyt
     assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
 
 
+@pytest.mark.parametrize(
+    "target_name",
+    ("generate_guarded_text", "generate_persona_visual_projection", "prepare_persona_snapshot"),
+)
+def test_bridge_cache_contract_rejects_missing_persona_guard_helper(
+    monkeypatch: pytest.MonkeyPatch, target_name: str
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    import qzone_bridge.llm as llm
+
+    monkeypatch.delattr(llm.QzoneLLM, target_name, raising=False)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_bridge_cache_contract_rejects_stale_persona_guard_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    import qzone_bridge.persona_guard as guard
+
+    monkeypatch.delattr(guard, "parse_visual_projection")
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+@pytest.mark.parametrize(
+    "target, stale",
+    [
+        ("resolver", lambda self, context, settings, event: ""),
+        ("projection", lambda self, event, *, provider_id="": ""),
+        ("snapshot", lambda self, event, *, provider_id="", prefer_current_provider=False: {}),
+        ("guarded", lambda self, event, prompt, *, provider_id="", system_prompt="", prefer_current_provider=False: ""),
+    ],
+)
+def test_bridge_cache_contract_rejects_each_stale_persona_signature(
+    monkeypatch: pytest.MonkeyPatch, target: str, stale
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    import qzone_bridge.llm as llm
+    import qzone_bridge.persona as persona
+
+    if target == "resolver":
+        monkeypatch.setattr(persona, "resolve_persona_prompt", stale)
+    elif target == "projection":
+        monkeypatch.setattr(llm.QzoneLLM, "generate_persona_visual_projection", stale)
+    elif target == "snapshot":
+        monkeypatch.setattr(llm.QzoneLLM, "prepare_persona_snapshot", stale)
+    else:
+        monkeypatch.setattr(llm.QzoneLLM, "generate_guarded_text", stale)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
 def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeypatch: pytest.MonkeyPatch) -> None:
     import qzone_bridge
 
     main = _import_main_with_stubs(monkeypatch)
     metadata = Path("metadata.yaml").read_text(encoding="utf-8")
-    assert qzone_bridge.__version__ == "0.9.2"
-    assert "version: 0.9.2" in metadata
-    assert qzone_bridge.BRIDGE_API_VERSION == 2026110402
+    assert qzone_bridge.__version__ == "0.9.3"
+    assert "version: 0.9.3" in metadata
+    assert qzone_bridge.BRIDGE_API_VERSION == 2026110403
     assert main.REQUIRED_QZONE_BRIDGE_API_VERSION == qzone_bridge.BRIDGE_API_VERSION
 
 
@@ -285,6 +334,9 @@ def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeyp
     [
         ("qzone_bridge.settings", "PluginSettings", "persona_id"),
         ("qzone_bridge.settings", "PluginSettings", "context_umo"),
+        ("qzone_bridge.settings", "PluginSettings", "persona_consistency_check"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_inherit_persona_visual"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_persona_visual_prompt"),
         ("qzone_bridge.settings", "PluginSettings", "auto_reply_enabled"),
         ("qzone_bridge.settings", "PluginSettings", "auto_reply_poll_interval"),
         ("qzone_bridge.settings", "PluginSettings", "auto_reply_delay_min"),
@@ -7687,6 +7739,7 @@ def test_generate_original_news_post_text_retries_copy_like_output(
 ) -> None:
     main = _import_main_with_stubs(monkeypatch)
     plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings()
     item = main.NewsItem(title="航天员返回地球后最想洗头", source="羊城晚报", item_id="news-1")
     responses = ["航天员返回地球后最想洗头", "回到地面后，最想念的也许就是那些日常小事。"]
 
@@ -7694,6 +7747,10 @@ def test_generate_original_news_post_text_retries_copy_like_output(
         return responses.pop(0)
 
     plugin._generate_news_post_text = fake_generate
+    class _LLM:
+        async def prepare_persona_snapshot(self, *args, **kwargs):
+            return {"persona_prompt": "", "provider_id": ""}
+    plugin._llm_adapter = lambda: _LLM()
 
     text = asyncio.run(plugin._generate_original_news_post_text(None, [item]))
 
@@ -8075,9 +8132,16 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
         def exception(self, *args, **kwargs): ...
 
     class _LLM:
+        async def prepare_persona_snapshot(self, event, **kwargs):
+            return {"persona_prompt": "", "provider_id": ""}
+
+        async def generate_persona_visual_projection(self, event, **kwargs):
+            return "左耳佩戴银色耳环"
+
         async def generate_text(self, event, prompt, **kwargs):
             captured["event"] = event
             captured["prompt"] = prompt
+            captured["system_prompt"] = kwargs.get("system_prompt", "")
             return ""
 
     plugin = object.__new__(main.QzoneStablePlugin)
@@ -8096,9 +8160,238 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
     assert "真实手机自拍" in prompt
     assert "浅色卫衣" in prompt
     assert "傍晚散步" in prompt
+    assert prompt.count("<视觉参考>") == 1
     assert captured["prompt"].startswith("根据日程生成自拍")
     assert captured["event"] is not None
-    assert captured["warnings"] == []
+    assert "今日日程明确要求的服装与姿势优先" in captured["system_prompt"]
+
+    echoed = plugin._assemble_life_image_prompt(
+        "黑发，今天穿浅色卫衣。黑发。<视觉参考>\n黑发\n</视觉参考>", "黑发"
+    )
+    assert echoed.count("<视觉参考>") == 1
+    assert "黑发，今天穿浅色卫衣。黑发。" in echoed  # ordinary generated words are preserved
+    assert "浅色卫衣" in echoed
+    negative = "今天穿蓝色卫衣，不穿白衬衫，保持当前动作姿态。"
+    assembled = plugin._assemble_life_image_prompt(negative, "白衬衫")
+    assert assembled.startswith(negative)
+    assert assembled.count("<视觉参考>") == 1
+    assert "不穿白衬衫" in assembled
+    assert "今日日程明确要求的服装和姿势优先" in assembled
+
+
+def test_life_image_prompt_static_mode_skips_persona_provider_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({
+        "life_publish": {
+            "use_llm_image_prompt": False,
+            "inherit_persona_visual": False,
+            "image_prompt_template": "静态模板：{life_context}",
+        }
+    })
+    plugin.llm = main.QzoneLLM(None, plugin.settings)
+    prompt = asyncio.run(plugin._generate_life_image_prompt(None, "今天散步"))
+    assert prompt == "静态模板：今天散步"
+
+
+@pytest.mark.parametrize("failure_policy", ["skip", "text_only"])
+def test_real_persona_guard_life_caption_failure_never_publishes_or_falls_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_policy: str
+) -> None:
+    from qzone_bridge.llm import QzoneLLM
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings.from_mapping({
+        "llm": {"persona_id": "p"},
+        "life_publish": {
+            "enabled": True, "mode": "publish", "failure_policy": failure_policy,
+            "use_life_context": False, "use_llm_image_prompt": False,
+            "inherit_persona_visual": False, "auto_caption": True,
+            "static_caption": "STATIC_FALLBACK_MUST_NOT_PUBLISH",
+            "image_prompt_template": "A selfie in the current setting.",
+        },
+    })
+    class Manager:
+        async def resolve_selected_persona(self, **kwargs):
+            return "p", {"prompt": "black hair"}, None, False
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "black hair"}
+    class Provider:
+        async def text_chat(self, *, prompt, contexts, system_prompt):
+            if prompt.startswith("Review whether"):
+                return '{"accepted":false,"rewrite":"SENSITIVE_REWRITE"}'
+            return "SENSITIVE_LIFE_CAPTION"
+    provider = Provider()
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, umo): return {"provider_settings": {}}
+        async def get_using_provider(self, **kwargs): return provider
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    plugin.data_dir = tmp_path
+    plugin.controller = type("Controller", (), {"publish_post": lambda self, **kwargs: pytest.fail("must not publish")})()
+
+    async def selfie(event, prompt):
+        return [object()], {"success": True, "images": []}
+    plugin._generate_life_selfie_media = selfie
+    result = asyncio.run(plugin._auto_life_publish_once())
+    assert result is None
+
+
+def test_life_projection_failure_text_only_uses_separately_approved_caption(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from qzone_bridge.llm import QzoneLLM
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings.from_mapping({
+        "llm": {"persona_id": "p"},
+        "life_publish": {
+            "enabled": True, "mode": "draft", "failure_policy": "text_only",
+            "use_life_context": False, "use_llm_image_prompt": True,
+            "inherit_persona_visual": True, "auto_caption": True,
+        },
+    })
+    class Manager:
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "black hair, silver earrings"}
+    class Provider:
+        def __init__(self): self.calls = []
+        async def text_chat(self, *, prompt, contexts, system_prompt):
+            self.calls.append(prompt)
+            if prompt.startswith("Extract only directly stated visual traits"):
+                return "malformed projection"
+            if prompt.startswith("Review whether"):
+                return '{"accepted":true,"rewrite":""}'
+            return "approved caption"
+    provider = Provider()
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, umo): return {"provider_settings": {}}
+        async def get_using_provider(self, **kwargs): return provider
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    plugin.data_dir = tmp_path
+    captured = []
+    async def store(post, **kwargs):
+        captured.append((post, kwargs))
+        return {"draft": True}
+    plugin._publish_or_draft_scheduled_post = store
+    result = asyncio.run(plugin._auto_life_publish_once())
+    assert result == {"draft": True}
+    assert len(captured) == 1
+    assert captured[0][0].content == "approved caption"
+    assert captured[0][0].media == []
+    assert len(provider.calls) == 3  # invalid projection, caption, approval review
+
+
+def test_real_life_guard_publishes_approved_caption_with_validated_visual_reference(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from qzone_bridge.llm import QzoneLLM
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings.from_mapping({
+        "llm": {"persona_id": "p"},
+        "life_publish": {
+            "enabled": True, "mode": "publish", "failure_policy": "skip",
+            "use_life_context": False, "use_llm_image_prompt": True,
+            "inherit_persona_visual": True, "auto_caption": True,
+            "image_retry_count": 0,
+        },
+    })
+    class Manager:
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "black hair, silver earrings"}
+    class Provider:
+        def __init__(self): self.calls = []
+        async def text_chat(self, *, prompt, contexts, system_prompt):
+            self.calls.append((prompt, system_prompt))
+            if "You extract only source-grounded visual fragments" in system_prompt:
+                return json.dumps({"appearance": ["black hair"], "accessories": ["silver earrings"], "clothing": []})
+            if prompt.startswith("Review whether"):
+                return '{"accepted":true,"rewrite":""}'
+            if "你是给 OmniDraw 自拍模式写画面动作/场景提示词的助手" in system_prompt:
+                return "Today at a cafe, a casual selfie."
+            return "Approved Life caption."
+    provider = Provider()
+    class Metadata:
+        def __init__(self, plugin): self.star_cls = plugin
+    class OmniDraw:
+        async def generate_selfie(self, *, action, return_result=False, **kwargs):
+            captured["action"] = action
+            return {"success": True, "images": [{"file_path": str(image_path)}]}
+    image_path = tmp_path / "fixture.png"
+    image_path.write_bytes(b"fixture")
+    omnidraw = OmniDraw()
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, umo): return {"provider_settings": {}}
+        async def get_using_provider(self, **kwargs): return provider
+        def get_registered_star(self, name):
+            return Metadata(omnidraw) if name == "astrbot_plugin_omnidraw" else None
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    plugin.data_dir = tmp_path
+    captured = {}
+    async def publish(post, **kwargs):
+        captured["post"] = post
+        return {"published": True}
+    plugin._publish_or_draft_scheduled_post = publish
+    assert asyncio.run(plugin._auto_life_publish_once()) == {"published": True}
+    assert captured["post"].content == "Approved Life caption."
+    assert len(captured["post"].media) == 1
+    assert "<视觉参考>" in captured["action"] and captured["action"].count("<视觉参考>") == 1
+    assert "black hair" in captured["action"] and "silver earrings" in captured["action"]
+    assert "今日日程明确要求的服装和姿势优先" in captured["action"]
+    assert len(provider.calls) == 4
+
+
+def test_life_visual_assembly_preserves_negation_and_deduplicates_only_owned_containers(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    text = "今天穿蓝色卫衣，不穿白衬衫，保持当前动作姿态。<视觉参考>旧内容</视觉参考>"
+    result = main.QzoneStablePlugin._assemble_life_image_prompt(text, "白衬衫")
+    assert result.startswith("今天穿蓝色卫衣，不穿白衬衫，保持当前动作姿态。")
+    assert result.count("<视觉参考>") == 1
+    assert "今日日程明确要求的服装和姿势优先" in result
+
+
+def test_life_publish_generation_scope_ends_before_publish_or_notify(monkeypatch: pytest.MonkeyPatch) -> None:
+    from contextlib import asynccontextmanager
+
+    from qzone_bridge.persona_guard import current_scope, generation_scope
+
+    main = _import_main_with_stubs(monkeypatch)
+
+    @asynccontextmanager
+    async def short_scope():
+        async with generation_scope(timeout=0.01):
+            yield
+
+    monkeypatch.setattr(main, "generation_scope", short_scope)
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = type("Settings", (), {"life_publish_mode": "publish"})()
+    post = main.PostPayload(content="caption", media=[])
+    async def prepared(*args, **kwargs):
+        assert current_scope() is not None
+        return post, [], False
+    plugin._auto_life_publish_once_scoped = prepared
+    async def publish(*args, **kwargs):
+        assert current_scope() is None
+        await asyncio.sleep(0.02)
+        return {"published": True}
+    plugin._publish_or_draft_scheduled_post = publish
+    result = asyncio.run(plugin._auto_life_publish_once())
+    assert result == {"published": True}
 
 
 def test_life_selfie_media_prefers_generate_selfie_return_result_method(
@@ -8978,6 +9271,117 @@ def test_auto_comment_pipeline_runs_judgment_reasoning_and_execution() -> None:
     assert calls[0][0] == "judge-provider"
     assert calls[1][0] == "reason-provider"
     assert calls[2] == ("execute", "friendly classmate tone")
+
+
+def test_configured_auto_comment_guard_rejection_does_not_fall_back_to_legacy_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from qzone_bridge.llm import QzoneLLM
+    from qzone_bridge.persona_guard import PersonaConsistencyError, current_scope
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings(persona_id="p")
+    settings.comment_pipeline_enabled = True
+    settings.comment_judgment_provider_id = "judge"
+    settings.comment_reasoning_provider_id = "reason"
+    settings.comment_execution_provider_id = "execute"
+    class Manager:
+        async def resolve_selected_persona(self, **kwargs):
+            return "p", {"prompt": "persona"}, None, False
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "persona"}
+    class Provider:
+        def __init__(self):
+            self.prompts = []
+            self.scope_counts = []
+        async def text_chat(self, *, prompt, contexts, system_prompt):
+            self.prompts.append(prompt)
+            self.scope_counts.append(current_scope().calls)
+            if prompt.startswith("You are judging"):
+                return '{"action":"comment","reason":"ordinary"}'
+            if prompt.startswith("Plan one natural"):
+                return "Friendly tone."
+            if prompt.startswith("Review whether"):
+                return '{"accepted":false,"rewrite":"untrusted correction"}'
+            return "unchecked legacy fallback"
+    provider = Provider()
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, umo): return {"provider_settings": {}}
+        async def get_provider_by_id(self, _provider_id): return provider
+        async def get_using_provider(self, **kwargs): return provider
+        async def llm_generate(self, **kwargs): return "unchecked legacy fallback"
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    plugin._generate_comment_text = lambda event, post: pytest.fail("must not invoke legacy fallback")
+    post = QzonePost(hostuin=123, fid="fid", summary="A normal day", nickname="Friend")
+    with pytest.raises(PersonaConsistencyError) as exc:
+        asyncio.run(plugin._generate_auto_comment_pipeline(post))
+    assert exc.value.code == "REVIEW_FAILED"
+    assert len(provider.prompts) == 5
+    assert provider.scope_counts == [1, 2, 3, 4, 5]
+    assert not any("unchecked legacy fallback" in prompt for prompt in provider.prompts)
+
+
+def test_news_originality_retry_reuses_single_guarded_scope_and_stays_within_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    from qzone_bridge.llm import QzoneLLM
+    from qzone_bridge.persona_guard import current_scope
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings(persona_id="p", news_prompt="Write a news post.")
+    title = "A headline that is copied verbatim"
+    class Manager:
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "persona"}
+    class Provider:
+        def __init__(self):
+            self.calls = []
+            self.scope_counts = []
+        async def text_chat(self, *, prompt, contexts, system_prompt):
+            self.calls.append(prompt)
+            self.scope_counts.append(current_scope().calls)
+            if prompt.startswith("Review whether"):
+                return '{"accepted":true,"rewrite":""}'
+            return title
+    provider = Provider()
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_using_provider(self, **kwargs): return provider
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    item = main.NewsItem(title=title, source="fixture")
+    assert asyncio.run(plugin._generate_original_news_post_text(None, [item])) == ""
+    assert len(provider.calls) == 4  # two generated candidates and their reviews in one 6-call scope
+    assert provider.scope_counts == [1, 2, 3, 4]
+
+
+def test_news_nonrequired_snapshot_preserves_legacy_current_provider_compatibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    from qzone_bridge.llm import QzoneLLM
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings(news_prompt="Write a news post.")
+    title = "A headline that is copied verbatim"
+    calls = []
+    class Context:
+        async def get_current_chat_provider_id(self, **kwargs): return "legacy-current"
+        async def llm_generate(self, *, prompt, system_prompt="", **kwargs):
+            calls.append(kwargs.get("chat_provider_id"))
+            if "chat_provider_id" in kwargs:
+                raise TypeError("legacy API has no provider selector")
+            return title
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    assert asyncio.run(plugin._generate_original_news_post_text(None, [main.NewsItem(title=title)])) == ""
+    assert calls == ["legacy-current", None, "legacy-current", None]
 
 
 def test_auto_comment_pipeline_skips_sensitive_context_before_execution() -> None:
