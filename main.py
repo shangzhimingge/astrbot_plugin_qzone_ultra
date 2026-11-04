@@ -36,7 +36,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026061301
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026110401
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -612,6 +612,32 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                 "life_publish_static_caption",
                 "life_publish_image_prompt_template",
                 "life_publish_caption_prompt",
+                "persona_id",
+                "context_umo",
+                "auto_reply_enabled",
+                "auto_reply_poll_interval",
+                "auto_reply_delay_min",
+                "auto_reply_delay_max",
+                "auto_reply_recent_posts",
+                "auto_reply_max_per_run",
+                "auto_reply_daily_limit",
+                "auto_reply_skip_low_information",
+                "auto_reply_probability",
+                "auto_reply_ignore_users",
+            )
+        },
+        "qzone_bridge.auto_reply": {
+            "AutoReplyConfig": (
+                "enabled",
+                "poll_interval",
+                "delay_min",
+                "delay_max",
+                "recent_posts",
+                "max_per_run",
+                "daily_limit",
+                "skip_low_information",
+                "reply_probability",
+                "ignore_users",
             )
         },
     }
@@ -634,21 +660,33 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
     signature_contracts = {
         "qzone_bridge.controller": {"QzoneDaemonController.list_feeds": "record_recent"},
         "qzone_bridge.daemon": {"QzoneDaemonService.list_feeds": "record_recent"},
-        "qzone_bridge.page_api": {"QzonePageApi.__init__": "preload_scheduler"},
+        "qzone_bridge.page_api": {
+            "QzonePageApi.__init__": (
+                "preload_scheduler",
+                "ai_comment_generator",
+                "ai_reply_generator",
+                "reply_lock",
+                "manual_reply_marker",
+            )
+        },
+        "qzone_bridge.llm": {"QzoneLLM.generate_text": ("inherit_persona",)},
     }
     for module_name, members in signature_contracts.items():
         module = sys.modules.get(module_name)
         if module is None:
             continue
         _verify_local_qzone_bridge_module(module_name, package_root)
-        for dotted_name, parameter in members.items():
+        for dotted_name, parameters in members.items():
             target: Any = module
             for part in dotted_name.split("."):
                 target = getattr(target, part, None)
                 if target is None:
                     return False
             try:
-                if parameter not in inspect.signature(target).parameters:
+                signature_parameters = inspect.signature(target).parameters
+                if isinstance(parameters, str):
+                    parameters = (parameters,)
+                if any(parameter not in signature_parameters for parameter in parameters):
                     return False
             except (TypeError, ValueError):
                 return False

@@ -235,6 +235,139 @@ def test_main_import_recovers_from_stale_page_api_constructor(monkeypatch: pytes
         sys.modules.pop("main", None)
 
 
+@pytest.mark.parametrize(
+    "missing_parameter",
+    ("ai_comment_generator", "ai_reply_generator", "reply_lock", "manual_reply_marker"),
+)
+def test_bridge_cache_contract_rejects_each_missing_page_api_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_parameter: str,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    import qzone_bridge.page_api as page_api
+
+    required = [
+        "controller", "post_service_factory", "settings", "preload_scheduler",
+        "ai_comment_generator", "ai_reply_generator", "reply_lock", "manual_reply_marker",
+    ]
+    required.remove(missing_parameter)
+    namespace: dict[str, object] = {}
+    exec(f"def __init__(self, *, {', '.join(required)}): pass", namespace)
+    old_class = type("CachedQzonePageApi", (), {"__init__": namespace["__init__"]})
+    monkeypatch.setattr(page_api, "QzonePageApi", old_class)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_bridge_cache_contract_rejects_missing_llm_persona_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    import qzone_bridge.llm as llm
+
+    def stale_generate_text(self, event, prompt, *, provider_id="", system_prompt="", prefer_current_provider=False):
+        return ""
+
+    monkeypatch.setattr(llm.QzoneLLM, "generate_text", stale_generate_text)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeypatch: pytest.MonkeyPatch) -> None:
+    import qzone_bridge
+
+    main = _import_main_with_stubs(monkeypatch)
+    metadata = Path("metadata.yaml").read_text(encoding="utf-8")
+    assert qzone_bridge.__version__ == "0.9.1"
+    assert "version: 0.9.1" in metadata
+    assert qzone_bridge.BRIDGE_API_VERSION == 2026110401
+    assert main.REQUIRED_QZONE_BRIDGE_API_VERSION == qzone_bridge.BRIDGE_API_VERSION
+
+
+@pytest.mark.parametrize(
+    "module_name,class_name,missing_field",
+    [
+        ("qzone_bridge.settings", "PluginSettings", "persona_id"),
+        ("qzone_bridge.settings", "PluginSettings", "context_umo"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_enabled"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_poll_interval"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_delay_min"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_delay_max"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_recent_posts"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_max_per_run"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_daily_limit"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_skip_low_information"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_probability"),
+        ("qzone_bridge.settings", "PluginSettings", "auto_reply_ignore_users"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "enabled"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "poll_interval"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "delay_min"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "delay_max"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "recent_posts"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "max_per_run"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "daily_limit"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "skip_low_information"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "reply_probability"),
+        ("qzone_bridge.auto_reply", "AutoReplyConfig", "ignore_users"),
+    ],
+)
+def test_bridge_cache_contract_rejects_each_missing_new_config_field(
+    monkeypatch: pytest.MonkeyPatch,
+    module_name: str,
+    class_name: str,
+    missing_field: str,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    module = sys.modules[module_name]
+    cls = getattr(module, class_name)
+    fields = dict(cls.__dataclass_fields__)
+    fields.pop(missing_field)
+    monkeypatch.setattr(cls, "__dataclass_fields__", fields)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_main_bootstrap_refreshes_stale_page_api_and_wires_full_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    saved_modules = {
+        name: module for name, module in sys.modules.items()
+        if name == "qzone_bridge" or name.startswith("qzone_bridge.")
+    }
+    import qzone_bridge.page_api as page_api
+
+    class CachedQzonePageApi:
+        def __init__(self, *, controller, post_service_factory, settings, preload_scheduler=None):
+            self.controller = controller
+
+    try:
+        monkeypatch.setattr(page_api, "QzonePageApi", CachedQzonePageApi)
+        main = _import_main_with_stubs(monkeypatch)
+        assert main.QzonePageApi is not CachedQzonePageApi
+        signature = inspect.signature(main.QzonePageApi.__init__).parameters
+        for parameter in ("ai_comment_generator", "ai_reply_generator", "reply_lock", "manual_reply_marker"):
+            assert parameter in signature
+
+        class Controller:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        monkeypatch.setattr(main, "QzoneDaemonController", Controller)
+        monkeypatch.setattr(main, "_standard_data_dir", lambda root: tmp_path)
+        monkeypatch.setattr(main, "_read_plugin_name", lambda root: "test-plugin")
+        monkeypatch.setattr(main, "preload_static_render_assets", lambda: None)
+        monkeypatch.setattr(main.QzoneStablePlugin, "_capture_onebot_client_from_context", lambda self: None)
+        monkeypatch.setattr(main.QzoneStablePlugin, "_register_page_web_apis", lambda self: None)
+
+        plugin = main.QzoneStablePlugin(object(), config={})
+        assert plugin.page_api.ai_comment_generator is not None
+        assert plugin.page_api.ai_reply_generator is not None
+        assert plugin.page_api.reply_lock is plugin.auto_reply_service.reply_lock
+        assert plugin.page_api.manual_reply_marker == plugin.auto_reply_service.mark_manual_reply
+    finally:
+        for name in list(sys.modules):
+            if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+        sys.modules.pop("main", None)
+
+
 def test_main_import_recovers_from_stale_llm_without_news_generator(monkeypatch: pytest.MonkeyPatch) -> None:
     saved_modules = {
         name: module
@@ -1345,6 +1478,11 @@ def test_ensure_running_restarts_incompatible_daemon(tmp_path, monkeypatch: pyte
 
     def mark_runtime_stale(state):
         state.runtime.version = "0.3.2"
+        state.session = SessionState(
+            uin=12345,
+            cookies={"uin": "o12345", "p_skey": "preserved-pskey"},
+            source="onebot",
+        )
 
     controller.store.update(mark_runtime_stale)
     runtime = controller._runtime()
@@ -1408,6 +1546,10 @@ def test_ensure_running_restarts_incompatible_daemon(tmp_path, monkeypatch: pyte
     assert calls["spawn"] == [runtime.daemon_port]
     assert status["daemon_state"] == "ready"
     assert status["daemon_version"] == qzone_bridge.__version__
+    preserved = controller.store.read().session
+    assert preserved.uin == 12345
+    assert preserved.cookies["p_skey"] == "preserved-pskey"
+    assert preserved.source == "onebot"
 
 
 def test_ensure_running_does_not_shutdown_foreign_health_service(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
