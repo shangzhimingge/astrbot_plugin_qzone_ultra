@@ -274,9 +274,9 @@ def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeyp
 
     main = _import_main_with_stubs(monkeypatch)
     metadata = Path("metadata.yaml").read_text(encoding="utf-8")
-    assert qzone_bridge.__version__ == "0.9.1"
-    assert "version: 0.9.1" in metadata
-    assert qzone_bridge.BRIDGE_API_VERSION == 2026110401
+    assert qzone_bridge.__version__ == "0.9.2"
+    assert "version: 0.9.2" in metadata
+    assert qzone_bridge.BRIDGE_API_VERSION == 2026110402
     assert main.REQUIRED_QZONE_BRIDGE_API_VERSION == qzone_bridge.BRIDGE_API_VERSION
 
 
@@ -1152,7 +1152,7 @@ def test_remote_media_response_cookies_do_not_pollute_qzone_session(monkeypatch:
             return False
 
     client = QzoneClient(SessionState(uin=12345, cookies={"uin": "o12345", "p_skey": "secret"}))
-    monkeypatch.setattr("qzone_bridge.client.is_remote_media_url_allowed", lambda source: True)
+    monkeypatch.setattr("qzone_bridge.client.check_remote_media_url", lambda source: source_policy.RemoteMediaUrlCheck(True, "ALLOWED", "example.test"))
     monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: _Stream())
     try:
         data, _, _ = asyncio.run(client._load_image_source({"kind": "image", "source": "https://example.test/a.png"}))
@@ -1183,7 +1183,7 @@ def test_remote_media_download_rejects_oversized_content_length(monkeypatch: pyt
             return False
 
     client = QzoneClient(SessionState(uin=12345, cookies={"uin": "o12345", "p_skey": "secret"}))
-    monkeypatch.setattr("qzone_bridge.client.is_remote_media_url_allowed", lambda source: True)
+    monkeypatch.setattr("qzone_bridge.client.check_remote_media_url", lambda source: source_policy.RemoteMediaUrlCheck(True, "ALLOWED", "example.test"))
     monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: _Stream())
     try:
         with pytest.raises(QzoneParseError) as error:
@@ -1212,7 +1212,7 @@ def test_remote_media_download_rejects_stream_that_exceeds_limit(monkeypatch: py
             return False
 
     client = QzoneClient(SessionState(uin=12345, cookies={"uin": "o12345", "p_skey": "secret"}))
-    monkeypatch.setattr("qzone_bridge.client.is_remote_media_url_allowed", lambda source: True)
+    monkeypatch.setattr("qzone_bridge.client.check_remote_media_url", lambda source: source_policy.RemoteMediaUrlCheck(True, "ALLOWED", "example.test"))
     monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: _Stream())
     try:
         with pytest.raises(QzoneParseError) as error:
@@ -1225,8 +1225,6 @@ def test_remote_media_download_rejects_stream_that_exceeds_limit(monkeypatch: py
 def test_remote_media_policy_blocks_localhost_and_private_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not source_policy.is_remote_media_url_allowed("http://127.0.0.1/a.png")
     assert not source_policy.is_remote_media_url_allowed("http://localhost/a.png")
-
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1238,7 +1236,6 @@ def test_remote_media_policy_blocks_localhost_and_private_dns(monkeypatch: pytes
 def test_remote_media_policy_allows_trusted_qq_media_domain_with_fake_ip_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1253,7 +1250,6 @@ def test_remote_media_policy_allows_trusted_qq_media_domain_with_fake_ip_dns(
 def test_remote_media_policy_allows_exact_qq_multimedia_video_url_from_onebot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1270,7 +1266,6 @@ def test_remote_media_policy_allows_exact_qq_multimedia_video_url_from_onebot(
 def test_remote_media_policy_allows_qq_multimedia_download_even_with_private_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1287,7 +1282,6 @@ def test_remote_media_policy_allows_qq_multimedia_download_even_with_private_dns
 def test_remote_media_policy_allows_trusted_qq_media_domain_with_mixed_public_and_fake_ip_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1307,7 +1301,6 @@ def test_remote_media_policy_allows_trusted_qq_media_domain_with_mixed_public_an
 def test_remote_media_policy_blocks_untrusted_domain_with_fake_ip_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1320,7 +1313,6 @@ def test_remote_media_policy_blocks_untrusted_domain_with_fake_ip_dns(
 def test_remote_media_policy_blocks_trusted_domain_with_private_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source_policy.remote_media_host_resolves_safely.cache_clear()
     monkeypatch.setattr(
         source_policy.socket,
         "getaddrinfo",
@@ -1328,6 +1320,327 @@ def test_remote_media_policy_blocks_trusted_domain_with_private_dns(
     )
 
     assert not source_policy.is_remote_media_url_allowed("https://qpic.cn/a.png")
+
+
+@pytest.mark.parametrize(
+    "source,dns_answer,expected_code",
+    [
+        ("not-a-url", None, "INVALID_URL"),
+        ("https://[broken/path", None, "INVALID_URL"),
+        ("https://media.example.test:bad/a.png", None, "INVALID_URL"),
+        ("https://media.example.test:70000/a.png", None, "INVALID_URL"),
+        ("http://localhost/a.png", None, "UNSAFE_HOST"),
+        ("https://media.example.test/a.png", "198.18.1.179", "UNSAFE_DNS"),
+        ("https://media.example.test/a.png", "10.0.0.5", "UNSAFE_DNS"),
+        ("https://media.example.test/a.png", "93.184.216.34", "ALLOWED"),
+    ],
+)
+def test_remote_media_diagnostic_codes_for_url_and_dns_branches(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    dns_answer: str | None,
+    expected_code: str,
+) -> None:
+    if dns_answer is not None:
+        monkeypatch.setattr(
+            source_policy.socket,
+            "getaddrinfo",
+            lambda *args, **kwargs: [(source_policy.socket.AF_INET, 0, 0, "", (dns_answer, 0))],
+        )
+    result = source_policy.check_remote_media_url(source)
+    assert result.code == expected_code
+    assert result.allowed is (expected_code == "ALLOWED")
+
+
+def test_remote_media_diagnostic_dns_failure_empty_and_mixed_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: (_ for _ in ()).throw(source_policy.socket.gaierror("SENSITIVE_RESOLVER_MARKER")),
+    )
+    failed = source_policy.check_remote_media_url("https://failure.example.test/path?token=SENSITIVE_URL_MARKER")
+    assert (failed.code, failed.host) == ("DNS_LOOKUP_FAILED", "failure.example.test")
+    assert "SENSITIVE" not in repr(failed)
+
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lambda *args, **kwargs: [])
+    empty = source_policy.check_remote_media_url("https://empty.example.test/path")
+    assert empty.code == "DNS_LOOKUP_FAILED"
+
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (source_policy.socket.AF_INET, 0, 0, "", ("93.184.216.34", 0)),
+            (source_policy.socket.AF_INET, 0, 0, "", ("10.0.0.5", 0)),
+        ],
+    )
+    mixed = source_policy.check_remote_media_url("https://mixed.example.test/path")
+    assert mixed.code == "UNSAFE_DNS"
+
+
+def test_remote_media_diagnostic_performs_one_dns_lookup_and_keeps_exact_qq_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda host, *args, **kwargs: calls.append(host)
+        or [(source_policy.socket.AF_INET, 0, 0, "", ("93.184.216.34", 0))],
+    )
+    allowed = source_policy.check_remote_media_url("https://media.example.test/a.png")
+    assert allowed.code == "ALLOWED" and calls == ["media.example.test"]
+    calls.clear()
+    qq = source_policy.check_remote_media_url("https://multimedia.nt.qq.com.cn/download/image")
+    assert qq.code == "ALLOWED" and qq.host == "multimedia.nt.qq.com.cn" and calls == []
+
+
+def test_remote_media_redirect_diagnostic_rejects_private_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    target, result = source_policy.check_remote_media_redirect(
+        "https://media.example.test/base", "http://127.0.0.1/private.png?token=SENSITIVE_MARKER"
+    )
+    assert target == ""
+    assert result.code == "UNSAFE_HOST" and result.host == "127.0.0.1"
+    assert "SENSITIVE" not in repr(result)
+
+
+def test_client_malformed_remote_url_error_is_fixed_and_sanitized() -> None:
+    client = QzoneClient(SessionState(uin=12345))
+    source = "https://[broken/path?token=SENSITIVE_MARKER"
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source({"kind": "image", "source": source}))
+        assert error.value.detail == {"reason": "INVALID_URL", "host": ""}
+        assert "SENSITIVE" not in str(error.value) + repr(error.value.detail)
+    finally:
+        asyncio.run(client.close())
+
+
+@pytest.mark.parametrize("source", [
+    "https://media.example.test:bad/image.png?token=SENSITIVE_MARKER",
+    "https://media.example.test:70000/image.png?token=SENSITIVE_MARKER",
+])
+def test_client_invalid_port_is_rejected_before_dns_or_http(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    dns_calls = []
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lambda *a, **kw: dns_calls.append(a))
+    client = QzoneClient(SessionState(uin=12345))
+    requests = []
+    monkeypatch.setattr(client._client, "stream", lambda *a, **kw: requests.append((a, kw)))
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source({"kind": "image", "source": source}))
+        assert error.value.detail["reason"] == "INVALID_URL"
+        assert error.value.detail["host"] == "media.example.test"
+        assert "SENSITIVE" not in str(error.value) + repr(error.value.detail)
+        assert dns_calls == [] and requests == []
+    finally:
+        asyncio.run(client.close())
+
+
+def test_client_dns_failure_sanitizes_resolver_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        source_policy.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("SENSITIVE_RESOLVER_MARKER")),
+    )
+    client = QzoneClient(SessionState(uin=12345))
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source({
+                "kind": "image",
+                "source": "https://failure.example.test/image?token=SENSITIVE_URL_MARKER",
+            }))
+        assert error.value.detail == {"reason": "DNS_LOOKUP_FAILED", "host": "failure.example.test"}
+        assert "域名解析失败" in str(error.value)
+        assert "SENSITIVE" not in str(error.value) + repr(error.value.detail)
+    finally:
+        asyncio.run(client.close())
+
+
+def test_client_recovers_from_fake_dns_and_diagnostics_hide_url_and_resolver_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answer = {"ip": "198.18.1.179", "calls": 0}
+    def lookup(host, *args, **kwargs):
+        answer["calls"] += 1
+        return [(source_policy.socket.AF_INET, 0, 0, "", (answer["ip"], 0))]
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lookup)
+
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+
+        async def aiter_bytes(self):
+            yield b"mock-image"
+
+    class _Stream:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = QzoneClient(SessionState(uin=12345))
+    requests = []
+    monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: requests.append((args, kwargs)) or _Stream())
+    source = "https://media.example.test/image.png?token=SENSITIVE_URL_MARKER"
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source({"kind": "image", "source": source}))
+        assert error.value.detail == {"reason": "UNSAFE_DNS", "host": "media.example.test"}
+        assert "SENSITIVE" not in str(error.value) + repr(error.value.detail)
+        assert "跳转" not in str(error.value)
+        assert requests == []
+
+        answer["ip"] = "93.184.216.34"
+        loaded = asyncio.run(client._load_image_source({"kind": "image", "source": source}))
+        assert loaded[0] == b"mock-image"
+        assert len(requests) == 1 and answer["calls"] == 2
+    finally:
+        asyncio.run(client.close())
+
+
+def test_client_recovers_from_dns_error_to_public_without_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = {"failure": True, "calls": 0}
+
+    def lookup(host, *args, **kwargs):
+        state["calls"] += 1
+        if state["failure"]:
+            raise source_policy.socket.gaierror("SENSITIVE_RESOLVER_MARKER")
+        return [(source_policy.socket.AF_INET, 0, 0, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lookup)
+
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+
+        async def aiter_bytes(self):
+            yield b"recovered"
+
+    class _Stream:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = QzoneClient(SessionState(uin=12345))
+    requests = []
+    monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: requests.append(1) or _Stream())
+    media = {"kind": "image", "source": "https://recovered.example.test/image.png"}
+    try:
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source(media))
+        assert error.value.detail == {"reason": "DNS_LOOKUP_FAILED", "host": "recovered.example.test"}
+        assert requests == []
+        state["failure"] = False
+        assert asyncio.run(client._load_image_source(media))[0] == b"recovered"
+        assert len(requests) == 1 and state["calls"] == 2
+    finally:
+        asyncio.run(client.close())
+
+
+def test_client_revalidates_dns_before_returning_cached_image_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    answer = {"ip": "93.184.216.34", "calls": 0}
+    def lookup(host, *args, **kwargs):
+        answer["calls"] += 1
+        return [(source_policy.socket.AF_INET, 0, 0, "", (answer["ip"], 0))]
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lookup)
+
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+
+        async def aiter_bytes(self):
+            yield b"cached-image"
+
+    class _Stream:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = QzoneClient(SessionState(uin=12345))
+    requests = []
+    monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: requests.append(1) or _Stream())
+    media = {"kind": "image", "source": "https://media.example.test/cached.png"}
+    try:
+        assert asyncio.run(client._load_image_source(media))[0] == b"cached-image"
+        answer["ip"] = "10.0.0.5"
+        with pytest.raises(QzoneParseError) as error:
+            asyncio.run(client._load_image_source(media))
+        assert error.value.detail == {"reason": "UNSAFE_DNS", "host": "media.example.test"}
+        assert len(requests) == 1
+        answer["ip"] = "93.184.216.34"
+        assert asyncio.run(client._load_image_source(media))[0] == b"cached-image"
+        assert len(requests) == 1 and answer["calls"] == 3
+    finally:
+        asyncio.run(client.close())
+
+
+def test_client_redirect_dns_validation_runs_off_event_loop_and_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    loop_thread = threading.get_ident()
+    dns_threads = []
+    dns_hosts = []
+    def lookup(host, *args, **kwargs):
+        dns_threads.append(threading.get_ident())
+        dns_hosts.append(host)
+        address = "10.0.0.5" if host == "private.example.test" else "93.184.216.34"
+        return [(source_policy.socket.AF_INET, 0, 0, "", (address, 0))]
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lookup)
+
+    class _Response:
+        status_code = 302
+        headers = {"location": "http://private.example.test/private.png?token=SENSITIVE_MARKER"}
+
+        async def aiter_bytes(self):
+            return
+            yield b""
+
+    class _Stream:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    client = QzoneClient(SessionState(uin=12345))
+    requests = []
+    monkeypatch.setattr(client._client, "stream", lambda *args, **kwargs: requests.append(args[1]) or _Stream())
+    async def run():
+        with pytest.raises(QzoneParseError) as error:
+            await client._load_image_source({"kind": "image", "source": "https://media.example.test/original.png"})
+        return error.value
+    try:
+        error = asyncio.run(run())
+        assert error.detail == {"reason": "UNSAFE_DNS", "host": "private.example.test"}
+        assert "跳转" in str(error)
+        assert "DNS 结果不是公网地址" in str(error)
+        assert "SENSITIVE" not in str(error) + repr(error.detail)
+        assert len(requests) == 1 and all("private.example.test" not in url for url in requests)
+        assert dns_hosts == ["media.example.test", "private.example.test"]
+        assert dns_threads and all(thread_id != loop_thread for thread_id in dns_threads)
+    finally:
+        asyncio.run(client.close())
+
+
+@pytest.mark.parametrize("missing_helper", ["check_remote_media_url", "check_remote_media_redirect"])
+def test_bridge_contract_requires_remote_media_diagnostic_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_helper: str,
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    monkeypatch.delattr(source_policy, missing_helper)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
 
 
 def test_base64_upload_sources_do_not_apply_plugin_size_limit(monkeypatch: pytest.MonkeyPatch) -> None:

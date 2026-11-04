@@ -36,7 +36,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026110401
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026110402
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -554,6 +554,7 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
         "qzone_bridge.page_api": ("PAGE_DETAIL_TIMEOUT_SECONDS", "PAGE_STATUS_TIMEOUT_SECONDS"),
         "qzone_bridge.publish_renderer": ("combine_rendered_post_cards", "SUPPORTS_COMMENT_RESULT_SECTIONS"),
         "qzone_bridge.social": ("extract_nickname",),
+        "qzone_bridge.source_policy": ("check_remote_media_url", "check_remote_media_redirect"),
     }
     for module_name, attributes in contract_attributes.items():
         module = sys.modules.get(module_name)

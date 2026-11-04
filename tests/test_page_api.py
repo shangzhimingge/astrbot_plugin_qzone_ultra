@@ -4,6 +4,8 @@ import asyncio
 import base64
 import logging
 import struct
+import socket
+import threading
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,8 @@ import httpx
 
 from qzone_bridge import page_api as page_api_module
 from qzone_bridge import page_media as page_media_module
+from qzone_bridge import source_policy
+from qzone_bridge.source_policy import RemoteMediaUrlCheck
 from qzone_bridge.astrbot_logging import configure_standalone_logging
 from qzone_bridge.errors import DaemonUnavailableError, QzoneParseError
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
@@ -1492,7 +1496,11 @@ def test_page_media_proxy_forwards_range_and_forces_download(monkeypatch) -> Non
         )
 
     async def scenario():
-        monkeypatch.setattr(page_media_module, "is_remote_media_url_allowed", lambda _value: True)
+        monkeypatch.setattr(
+            page_media_module,
+            "check_remote_media_url",
+            lambda _value: RemoteMediaUrlCheck(True, "ALLOWED", "photo.qq.com"),
+        )
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         stream, status, headers = await open_page_media_stream(
             {
@@ -1516,6 +1524,40 @@ def test_page_media_proxy_forwards_range_and_forces_download(monkeypatch) -> Non
     assert headers["Content-Range"] == "bytes 0-3/8"
     assert headers["Content-Disposition"].startswith("attachment;")
     assert "filename*=UTF-8''" in headers["Content-Disposition"]
+
+
+def test_page_media_dns_and_redirect_checks_run_off_event_loop(monkeypatch) -> None:
+    loop_thread = threading.get_ident()
+    dns_threads = []
+    dns_hosts = []
+
+    def lookup(host, *args, **kwargs):
+        dns_hosts.append(host)
+        dns_threads.append(threading.get_ident())
+        return [(socket.AF_INET, 0, 0, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(source_policy.socket, "getaddrinfo", lookup)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "media.example.test":
+            return httpx.Response(302, headers={"location": "https://cdn.example.test/file.mp4"}, request=request)
+        return httpx.Response(206, headers={"content-type": "video/mp4"}, content=b"mock", request=request)
+
+    async def scenario():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False)
+        try:
+            stream, status, _ = await open_page_media_stream(
+                {"source": "https://media.example.test/base.mp4", "mime_type": "video/mp4"}, client=client
+            )
+            body = b"".join([chunk async for chunk in stream])
+            return body, status
+        finally:
+            await client.aclose()
+
+    body, status = asyncio.run(scenario())
+    assert (body, status) == (b"mock", 206)
+    assert dns_hosts == ["media.example.test", "cdn.example.test"]
+    assert dns_threads and all(thread_id != loop_thread for thread_id in dns_threads)
 
 
 def test_page_feed_exposes_normalized_media_without_losing_legacy_images() -> None:
