@@ -2,6 +2,11 @@ import asyncio
 
 import pytest
 
+pytest.importorskip(
+    "astrbot.core.platform.message_session",
+    reason="AstrBot core is required for Persona/session contract integration tests",
+)
+
 from qzone_bridge.llm import QzoneLLM
 from qzone_bridge.persona import PersonaResolutionError, resolve_persona_prompt
 from qzone_bridge.settings import PluginSettings

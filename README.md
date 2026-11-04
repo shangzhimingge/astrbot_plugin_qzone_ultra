@@ -56,6 +56,12 @@ pip install -r requirements.txt
 3. 重启 AstrBot，或在 AstrBot 管理面板重新加载插件。
 4. 在 QQ 私聊或群聊里发送 `/qzone status` 检查 daemon 和 Cookie 状态。
 
+### 开发测试
+
+- 仅安装插件依赖的环境（例如仓库 CI）可运行 `python -m pytest -q`；依赖 AstrBot core 的 Persona/MessageSession 合同集成模块会显式 skip，其余插件测试仍照常执行。
+- 完整集成测试需安装兼容的 AstrBot core；本次源码与会话合同核查使用本机 AstrBot `4.27.5`，运行 `python -m pytest -q` 应包含全部 Persona/session 测试。
+- 不要将插件-only 环境下的测试结果表述为 Persona/session 集成测试已运行。
+
 插件会在首次使用时按需启动本地 daemon。daemon 默认使用 `18999` 端口并只监听 `127.0.0.1`，用于隔离 QQ 空间请求、Cookie 管理和渲染逻辑。除非端口被占用，不建议修改默认端口；如果系统防火墙或安全软件拦截本地连接，请放行本插件的 `18999` 端口。
 
 浏览器打开 `http://127.0.0.1:18999/` 或 `/health` 时只返回最小公开健康信息，用于确认端口可达。未认证公开响应只包含 `daemon_state`、`daemon_port`、`daemon_version`，其中 `daemon_state` 只表示进程生命周期，不包含登录、绑定、Cookie、QQ 号、时间戳、token、缓存或 revision 等状态；完整 daemon 状态和登录信息仍必须通过插件命令或携带 `X-Qzone-Secret` 的本地请求获取。
