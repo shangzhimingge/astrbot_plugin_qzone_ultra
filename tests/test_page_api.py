@@ -154,6 +154,148 @@ def _api(controller: _Controller | None = None) -> QzonePageApi:
     )
 
 
+def test_ai_comment_uses_fresh_post_context_and_returns_draft_only():
+    controller = _Controller()
+    seen = []
+
+    async def generate(post):
+        seen.append(post)
+        return "generated draft"
+
+    api = QzonePageApi(
+        controller=controller,
+        post_service_factory=lambda: None,
+        settings=SimpleNamespace(max_feed_limit=20),
+        ai_comment_generator=generate,
+    )
+    post_id = asyncio.run(api.feed({}))['data']['items'][0]['id']
+    result = asyncio.run(api.ai_comment({"id": post_id, "content": "untrusted", "nickname": "forged"}))
+    assert result["data"]["content"] == "generated draft"
+    assert seen[0].summary == "detail text"
+    assert controller.detail_request_count == 1
+
+
+def test_ai_reply_checks_comment_identity_against_fresh_post_detail():
+    controller = _Controller()
+    seen = []
+
+    async def generate(post, comment):
+        seen.append((post, comment))
+        return "reply draft"
+
+    api = QzonePageApi(
+        controller=controller,
+        post_service_factory=lambda: None,
+        settings=SimpleNamespace(max_feed_limit=20),
+        ai_reply_generator=generate,
+    )
+    post_id = asyncio.run(api.feed({}))['data']['items'][0]['id']
+    result = asyncio.run(api.ai_reply({"id": post_id, "commentid": "comment-1", "comment_uin": 30003}))
+    assert result["data"]["content"] == "reply draft"
+    assert seen[0][1].content == "nice"
+    with pytest.raises(QzoneParseError):
+        asyncio.run(api.ai_reply({"id": post_id, "commentid": "forged", "comment_uin": 30003}))
+
+
+def test_ai_draft_provider_errors_are_redacted():
+    async def generate(post):
+        raise RuntimeError("sensitive provider credential marker")
+
+    controller = _Controller()
+    api = QzonePageApi(
+        controller=controller,
+        post_service_factory=lambda: None,
+        settings=SimpleNamespace(max_feed_limit=20),
+        ai_comment_generator=generate,
+    )
+    post_id = asyncio.run(api.feed({}))['data']['items'][0]['id']
+    with pytest.raises(QzoneParseError) as caught:
+        asyncio.run(api.ai_comment({"id": post_id}))
+    payload, _ = page_error_payload(caught.value)
+    assert "sensitive provider credential marker" not in str(payload)
+    assert payload["message"] == "AI 草稿生成失败，请稍后重试。"
+
+
+def test_ai_draft_timeout_covers_context_and_generation_and_releases_slot(monkeypatch):
+    async def generate(post):
+        await asyncio.sleep(0.2)
+        return "too late"
+
+    controller = _Controller()
+    api = QzonePageApi(
+        controller=controller,
+        post_service_factory=lambda: None,
+        settings=SimpleNamespace(max_feed_limit=20),
+        ai_comment_generator=generate,
+    )
+    post_id = asyncio.run(api.feed({}))['data']['items'][0]['id']
+    monkeypatch.setattr(page_api_module, "PAGE_AI_DRAFT_TIMEOUT_SECONDS", 0.01)
+    with pytest.raises(QzoneParseError, match="生成超时"):
+        asyncio.run(api.ai_comment({"id": post_id}))
+    assert api._ai_generation_slots._value == 2
+
+
+def test_ai_draft_slot_saturation_returns_busy_instead_of_queueing():
+    async def run():
+        controller = _Controller()
+        async def generate(post):
+            return "draft"
+        api = QzonePageApi(
+            controller=controller,
+            post_service_factory=lambda: None,
+            settings=SimpleNamespace(max_feed_limit=20),
+            ai_comment_generator=generate,
+        )
+        post_id = (await api.feed({}))['data']['items'][0]['id']
+        await api._ai_generation_slots.acquire()
+        await api._ai_generation_slots.acquire()
+        try:
+            with pytest.raises(QzoneParseError, match="繁忙"):
+                await api.ai_comment({"id": post_id})
+        finally:
+            api._ai_generation_slots.release()
+            api._ai_generation_slots.release()
+    asyncio.run(run())
+
+
+def test_manual_page_reply_marks_only_own_posts_for_auto_reply_deduplication():
+    async def run():
+        class OwnController(_Controller):
+            async def list_feeds(self, **kwargs):
+                payload = await super().list_feeds(**kwargs)
+                payload["items"][0]["hostuin"] = self.status["login_uin"]
+                return payload
+
+        own_marks = []
+        own_controller = OwnController()
+        async def marker(*args):
+            own_marks.append(args)
+            return True
+        own_api = QzonePageApi(
+            controller=own_controller, post_service_factory=lambda: None,
+            settings=SimpleNamespace(max_feed_limit=20), manual_reply_marker=marker,
+        )
+        own_id = (await own_api.feed({}))['data']['items'][0]['id']
+        await own_api.reply({"id": own_id, "commentid": "comment-1", "comment_uin": 30003, "content": "manual"})
+        assert own_marks == [(10001, 10001, "fid-secret", "comment-1", 30003)]
+
+        friend_marks = []
+        friend_api = QzonePageApi(
+            controller=_Controller(), post_service_factory=lambda: None,
+            settings=SimpleNamespace(max_feed_limit=20),
+            manual_reply_marker=lambda *args: _record(friend_marks, *args),
+        )
+        friend_id = (await friend_api.feed({}))['data']['items'][0]['id']
+        await friend_api.reply({"id": friend_id, "commentid": "comment-1", "comment_uin": 30003, "content": "manual"})
+        assert friend_marks == []
+    asyncio.run(run())
+
+
+async def _record(items, *values):
+    items.append(values)
+    return True
+
+
 def _png_bytes(width: int = 32, height: int = 32, *, pad_bytes: int = 0) -> bytes:
     raw = b"".join(b"\x00" + (b"\x28\x8c\xf0" * width) for _ in range(height))
 

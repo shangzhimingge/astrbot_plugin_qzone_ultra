@@ -44,6 +44,8 @@ PAGE_MAX_LIMIT = 30
 PAGE_DETAIL_TIMEOUT_SECONDS = 8.0
 PAGE_STATUS_TIMEOUT_SECONDS = 2.0
 PAGE_DETAIL_CACHE_TTL_SECONDS = 15.0
+PAGE_AI_DRAFT_TIMEOUT_SECONDS = 45.0
+PAGE_AI_SLOT_WAIT_SECONDS = 0.05
 
 
 @dataclass(slots=True)
@@ -138,12 +140,21 @@ class QzonePageApi:
         settings: Any,
         status_provider: Callable[[], Awaitable[dict[str, Any]]] | None = None,
         preload_scheduler: Callable[[str], None] | None = None,
+        ai_comment_generator: Callable[[QzonePost], Awaitable[str]] | None = None,
+        ai_reply_generator: Callable[[QzonePost, QzoneComment], Awaitable[str]] | None = None,
+        reply_lock: asyncio.Lock | None = None,
+        manual_reply_marker: Callable[[int, int, str, str, int], Awaitable[bool]] | None = None,
     ):
         self.controller = controller
         self.post_service_factory = post_service_factory
         self.settings = settings
         self.status_provider = status_provider
         self.preload_scheduler = preload_scheduler
+        self.ai_comment_generator = ai_comment_generator
+        self.ai_reply_generator = ai_reply_generator
+        self._ai_generation_slots = asyncio.Semaphore(2)
+        self.reply_lock = reply_lock or asyncio.Lock()
+        self.manual_reply_marker = manual_reply_marker
         self._refs_by_id: dict[str, PagePostRef] = {}
         self._ids_by_ref: dict[tuple[int, str, int], str] = {}
         self._feed_seen_refs: dict[tuple[str, int], set[tuple[int, str, int]]] = {}
@@ -798,14 +809,18 @@ class QzonePageApi:
             raise QzoneParseError("回复内容不能为空。")
         if not commentid or not comment_uin:
             raise QzoneParseError("缺少要回复的评论。")
-        payload = await self.controller.reply_comment(
-            hostuin=ref.hostuin,
-            fid=ref.fid,
-            commentid=commentid,
-            comment_uin=comment_uin,
-            content=content,
-            appid=ref.appid,
-        )
+        async with self.reply_lock:
+            payload = await self.controller.reply_comment(
+                hostuin=ref.hostuin,
+                fid=ref.fid,
+                commentid=commentid,
+                comment_uin=comment_uin,
+                content=content,
+                appid=ref.appid,
+            )
+            login_uin = _to_int(status.get("login_uin") or status.get("uin"), 0)
+            if self.manual_reply_marker is not None and login_uin and ref.hostuin == login_uin:
+                await self.manual_reply_marker(login_uin, ref.hostuin, ref.fid, commentid, comment_uin)
         return _success(
             {
                 "reply": {
@@ -817,6 +832,104 @@ class QzonePageApi:
             },
             message="回复已发送。",
         )
+
+    async def _ai_generation_context(
+        self, body: dict[str, Any] | None, *, reply: bool
+    ) -> tuple[QzonePost, QzoneComment | None]:
+        body = body or {}
+        ref = self._decode_post_ref(body.get("id") or body.get("post_id"))
+        if reply:
+            commentid = str(body.get("commentid") or body.get("comment_id") or "").strip()
+            comment_uin = _to_int(body.get("comment_uin") or body.get("commentUin"), 0)
+            if not commentid or len(commentid) > 128 or not comment_uin:
+                raise QzoneParseError("缺少要回复的评论。")
+        else:
+            commentid, comment_uin = "", 0
+        status = await self._ensure_cookie_bound()
+        busi_param = json.dumps(ref.busi_param, ensure_ascii=False, separators=(",", ":")) if ref.busi_param else ""
+        detail = await asyncio.wait_for(
+            self._detail_uncached(ref, status, busi_param),
+            timeout=max(0.001, float(PAGE_DETAIL_TIMEOUT_SECONDS)),
+        )
+        data = detail.get("data") if isinstance(detail, dict) else None
+        post_data = data.get("post") if isinstance(data, dict) else None
+        if not isinstance(post_data, dict) or data.get("partial"):
+            raise QzoneParseError("说说详情尚未确认，暂时不能生成草稿。")
+        comments = []
+        target = None
+        for item in post_data.get("comments") or []:
+            if not isinstance(item, dict):
+                continue
+            comment = QzoneComment(
+                commentid=str(item.get("id") or item.get("commentid") or ""),
+                uin=_to_int(item.get("author", {}).get("uin") if isinstance(item.get("author"), dict) else item.get("uin"), 0),
+                nickname=str(item.get("author", {}).get("nickname") if isinstance(item.get("author"), dict) else item.get("nickname") or ""),
+                content=str(item.get("content") or ""),
+                created_at=_to_int(item.get("created_at"), 0),
+                parent_id=str(item.get("parent_id") or ""),
+            )
+            comments.append(comment)
+            if comment.commentid == commentid and comment.uin == comment_uin:
+                target = comment
+        if reply and target is None:
+            raise QzoneParseError("目标评论已不存在或不属于这条说说。")
+        author = post_data.get("author") if isinstance(post_data.get("author"), dict) else {}
+        stats = post_data.get("stats") if isinstance(post_data.get("stats"), dict) else {}
+        post = QzonePost(
+            hostuin=ref.hostuin,
+            fid=ref.fid,
+            appid=ref.appid,
+            summary=str(post_data.get("content") or ""),
+            nickname=str(author.get("nickname") or ""),
+            created_at=_to_int(post_data.get("created_at"), 0),
+            like_count=_to_int(stats.get("likes"), 0),
+            comment_count=_to_int(stats.get("comments"), 0),
+            images=[str(item) for item in post_data.get("images", []) if isinstance(item, str)],
+            comments=comments,
+            busi_param=ref.busi_param,
+        )
+        return post, target
+
+    async def _ai_draft(self, body: dict[str, Any] | None, *, reply: bool) -> dict[str, Any]:
+        generator = self.ai_reply_generator if reply else self.ai_comment_generator
+        if generator is None:
+            raise QzoneParseError("AI 草稿功能未配置。")
+        try:
+            await asyncio.wait_for(self._ai_generation_slots.acquire(), timeout=PAGE_AI_SLOT_WAIT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            raise QzoneParseError("AI 草稿生成繁忙，请稍后重试。") from exc
+        try:
+            async def generate() -> str:
+                post, comment = await self._ai_generation_context(body, reply=reply)
+                try:
+                    value = await generator(post, comment) if reply else await generator(post)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    raise QzoneParseError("AI 草稿生成失败，请稍后重试。") from exc
+                return str(value or "").strip()
+
+            try:
+                content = await asyncio.wait_for(generate(), timeout=PAGE_AI_DRAFT_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as exc:
+                raise QzoneParseError("AI 草稿生成超时，请稍后重试。") from exc
+            except (QzoneParseError, QzoneNeedsRebind, DaemonUnavailableError):
+                raise
+            except Exception as exc:
+                # Keep controller/provider implementation details out of the Pages response.
+                raise QzoneParseError("获取说说上下文失败，请稍后重试。") from exc
+        finally:
+            self._ai_generation_slots.release()
+        content = str(content or "").strip()
+        if not content:
+            raise QzoneParseError("AI 未生成有效草稿。")
+        return _success({"content": content})
+
+    async def ai_comment(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return await self._ai_draft(body, reply=False)
+
+    async def ai_reply(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return await self._ai_draft(body, reply=True)
 
     async def delete(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
         self._schedule_preload("page delete")

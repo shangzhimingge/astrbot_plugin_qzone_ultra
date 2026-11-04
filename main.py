@@ -713,6 +713,7 @@ from qzone_bridge.auto_comment import (
     AutoCommentPipelineResult,
     AutoCommentStateStore,
 )
+from qzone_bridge.auto_reply import AutoReplyConfig, AutoReplyService
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftPost, DraftStore
 from qzone_bridge.errors import (
@@ -1029,17 +1030,29 @@ class QzoneStablePlugin(Star):
         self._last_page_feed_preload_at = 0.0
         self._auto_bind_bootstrap_succeeded = False
         self._scheduled_tasks: list[asyncio.Task] = []
+        self._reply_send_lock = asyncio.Lock()
         self._publisher_profile_cache: tuple[int, RenderProfile] | None = None
         self._publisher_profile_preload_task: asyncio.Task | None = None
         self.drafts = DraftStore(self.data_dir / "drafts.json")
         self.posts = PostStore(self.data_dir / "posts.json")
         self.llm = QzoneLLM(self._context, self.settings)
+        self.auto_reply_service = AutoReplyService(
+            controller=self.controller,
+            state_path=self.data_dir / "auto_reply_state.json",
+            config=AutoReplyConfig.from_settings(self.settings),
+            generate_reply=lambda post, comment: self._generate_reply_text(None, post, comment),
+            reply_lock=self._reply_send_lock,
+        )
         self.page_api = QzonePageApi(
             controller=self.controller,
             post_service_factory=self._post_service,
             settings=self.settings,
             status_provider=self._status_with_recovery,
             preload_scheduler=self._schedule_page_preload,
+            ai_comment_generator=lambda post: self._generate_comment_text(None, post),
+            ai_reply_generator=lambda post, comment: self._generate_reply_text(None, post, comment),
+            reply_lock=self._reply_send_lock,
+            manual_reply_marker=self.auto_reply_service.mark_manual_reply,
         )
         self._pillowmd_style: Any | None = None
         self._pillowmd_style_dir = ""
@@ -1136,6 +1149,8 @@ class QzoneStablePlugin(Star):
             ("page/like", self.page_like, ["POST"], "Qzone Page like"),
             ("page/comment", self.page_comment, ["POST"], "Qzone Page comment"),
             ("page/reply", self.page_reply, ["POST"], "Qzone Page reply"),
+            ("page/ai-comment", self.page_ai_comment, ["POST"], "Qzone Page AI comment draft"),
+            ("page/ai-reply", self.page_ai_reply, ["POST"], "Qzone Page AI reply draft"),
             ("page/delete", self.page_delete, ["POST"], "Qzone Page delete"),
             ("page/upload-media", self.page_upload_media, ["POST"], "Qzone Page upload media"),
             ("page/media", self.page_media, ["GET"], "Qzone Page media stream"),
@@ -1229,6 +1244,14 @@ class QzoneStablePlugin(Star):
     async def page_reply(self):
         body = await self._page_json_body()
         return await self._page_json(lambda: self.page_api.reply(body))
+
+    async def page_ai_comment(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.ai_comment(body))
+
+    async def page_ai_reply(self):
+        body = await self._page_json_body()
+        return await self._page_json(lambda: self.page_api.ai_reply(body))
 
     async def page_delete(self):
         body = await self._page_json_body()
@@ -4599,6 +4622,9 @@ class QzoneStablePlugin(Star):
 
     def _start_scheduled_tasks(self) -> None:
         self._scheduled_tasks = [task for task in self._scheduled_tasks if not task.done()]
+        auto_reply_service = getattr(self, "auto_reply_service", None)
+        if auto_reply_service is not None:
+            auto_reply_service.start()
         if self.settings.publish_cron:
             logger.info(
                 "qzone scheduled publish configured cron=%s offset=%s life_publish_enabled=%s life_mode=%s life_failure_policy=%s",
@@ -5905,14 +5931,18 @@ class QzoneStablePlugin(Star):
             content = await self._generate_reply_text(event, post, comment)
             if not content.strip():
                 content = "收到啦。"
-            payload = await self.controller.reply_comment(
-                hostuin=hostuin,
-                fid=fid,
-                commentid=comment.commentid,
-                comment_uin=comment.uin,
-                content=content.strip(),
-                appid=post.appid,
-            )
+            async with self._reply_send_lock:
+                payload = await self.controller.reply_comment(
+                    hostuin=hostuin,
+                    fid=fid,
+                    commentid=comment.commentid,
+                    comment_uin=comment.uin,
+                    content=content.strip(),
+                    appid=post.appid,
+                )
+                await self.auto_reply_service.mark_manual_reply(
+                    int(status.get("login_uin") or 0), hostuin, fid, comment.commentid, comment.uin
+                )
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
@@ -7082,6 +7112,9 @@ class QzoneStablePlugin(Star):
         return text
 
     async def terminate(self):
+        auto_reply_service = getattr(self, "auto_reply_service", None)
+        if auto_reply_service is not None:
+            await auto_reply_service.stop()
         for task in self._scheduled_tasks:
             task.cancel()
         if self._scheduled_tasks:
