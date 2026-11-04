@@ -13,6 +13,20 @@ DEFAULT_USER_AGENT = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT = 1
+DEFAULT_LIFE_PUBLISH_IMAGE_STYLE_PROMPT = (
+    "日系二次元厚涂插画，细腻笔触与自然柔和的明暗塑造，保留角色五官、发丝和配饰细节；"
+    "采用自拍或生活随手构图，不作真人摄影或写实皮肤质感，不强制平涂赛璐璐，不改变角色原有形象"
+)
+DEFAULT_LIFE_PUBLISH_IMAGE_PROMPT_TEMPLATE = (
+    "为人物生成自然的自拍或生活随手构图提示，结合有依据的当前场景，不推断未知活动或地点。\n\n"
+    "{life_context}"
+)
+DEFAULT_LIFE_PUBLISH_CAPTION_PROMPT = (
+    "根据给定日期的生活日程和自拍画面，写一条适合 QQ 空间发布的简短说说。"
+    "自然、有生活感，不要解释。\n\n"
+    "日程上下文：\n{life_context}\n\n"
+    "自拍提示词：\n{image_prompt}"
+)
 
 
 def _as_mapping(config: Any) -> dict[str, Any]:
@@ -196,18 +210,11 @@ class PluginSettings:
     life_publish_size: str = ""
     life_publish_extra_params: str = ""
     life_publish_image_retry_count: int = DEFAULT_LIFE_PUBLISH_IMAGE_RETRY_COUNT
+    life_publish_timezone: str = "Asia/Shanghai"
+    life_publish_image_style_prompt: str = DEFAULT_LIFE_PUBLISH_IMAGE_STYLE_PROMPT
     life_publish_static_caption: str = "今日份生活碎片。"
-    life_publish_image_prompt_template: str = (
-        "根据今日日程和穿搭，写一段适合 OmniDraw 自拍模式的生图提示词。"
-        "画面要像真实手机自拍或日常随手拍，包含场景、动作、服装、光线和氛围。\n\n"
-        "{life_context}"
-    )
-    life_publish_caption_prompt: str = (
-        "根据今日日程和自拍画面，写一条适合 QQ 空间发布的简短说说。"
-        "自然、有生活感，不要解释。\n\n"
-        "日程上下文：\n{life_context}\n\n"
-        "自拍提示词：\n{image_prompt}"
-    )
+    life_publish_image_prompt_template: str = DEFAULT_LIFE_PUBLISH_IMAGE_PROMPT_TEMPLATE
+    life_publish_caption_prompt: str = DEFAULT_LIFE_PUBLISH_CAPTION_PROMPT
     news_scopes: list[str] = field(default_factory=lambda: ["china"])
     news_keywords: list[str] = field(default_factory=list)
     news_custom_rss_urls: list[str] = field(default_factory=list)
@@ -376,6 +383,15 @@ class PluginSettings:
                 minimum=0,
                 maximum=5,
             ),
+            life_publish_timezone=str(_nested(mapping, "life_publish", "timezone", "Asia/Shanghai")),
+            life_publish_image_style_prompt=str(
+                _nested(
+                    mapping,
+                    "life_publish",
+                    "image_style_prompt",
+                    DEFAULT_LIFE_PUBLISH_IMAGE_STYLE_PROMPT,
+                )
+            ).strip(),
             life_publish_static_caption=str(
                 _nested(mapping, "life_publish", "static_caption", cls.life_publish_static_caption)
                 or cls.life_publish_static_caption
@@ -385,13 +401,13 @@ class PluginSettings:
                     mapping,
                     "life_publish",
                     "image_prompt_template",
-                    cls.life_publish_image_prompt_template,
+                    DEFAULT_LIFE_PUBLISH_IMAGE_PROMPT_TEMPLATE,
                 )
-                or cls.life_publish_image_prompt_template
+                or DEFAULT_LIFE_PUBLISH_IMAGE_PROMPT_TEMPLATE
             ),
             life_publish_caption_prompt=str(
-                _nested(mapping, "life_publish", "caption_prompt", cls.life_publish_caption_prompt)
-                or cls.life_publish_caption_prompt
+                _nested(mapping, "life_publish", "caption_prompt", DEFAULT_LIFE_PUBLISH_CAPTION_PROMPT)
+                or DEFAULT_LIFE_PUBLISH_CAPTION_PROMPT
             ),
             news_scopes=normalize_news_scopes(_nested(mapping, "news", "scopes", ["china"])),
             news_keywords=[str(item).strip() for item in _as_list(_nested(mapping, "news", "keywords", [])) if str(item).strip()],

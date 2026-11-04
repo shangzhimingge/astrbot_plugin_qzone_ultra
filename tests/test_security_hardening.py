@@ -323,10 +323,36 @@ def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeyp
 
     main = _import_main_with_stubs(monkeypatch)
     metadata = Path("metadata.yaml").read_text(encoding="utf-8")
-    assert qzone_bridge.__version__ == "0.9.3"
-    assert "version: 0.9.3" in metadata
-    assert qzone_bridge.BRIDGE_API_VERSION == 2026110403
+    assert qzone_bridge.__version__ == "0.9.4"
+    assert "version: 0.9.4" in metadata
+    assert qzone_bridge.BRIDGE_API_VERSION == 2026110501
     assert main.REQUIRED_QZONE_BRIDGE_API_VERSION == qzone_bridge.BRIDGE_API_VERSION
+
+
+@pytest.mark.parametrize("attribute", ["capture_life_inputs", "project_life_context", "unknown_life_context"])
+def test_bridge_cache_contract_rejects_missing_life_context_helper(monkeypatch: pytest.MonkeyPatch, attribute: str) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    module = sys.modules["qzone_bridge.life_context"]
+    monkeypatch.setattr(module, attribute, None)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_bridge_cache_contract_rejects_stale_life_context_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    module = sys.modules["qzone_bridge.life_context"]
+    monkeypatch.setattr(module, "capture_life_inputs", lambda: None)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_life_timezone_and_style_settings_defaults_and_explicit_empty_style() -> None:
+    defaults = PluginSettings.from_mapping({})
+    assert defaults.life_publish_timezone == "Asia/Shanghai"
+    assert "日系二次元厚涂插画" in defaults.life_publish_image_style_prompt
+    assert "真实手机自拍" not in defaults.life_publish_image_prompt_template
+    assert "给定日期" in defaults.life_publish_caption_prompt
+    explicit = PluginSettings.from_mapping({"life_publish": {"timezone": "UTC+08:00", "image_style_prompt": ""}})
+    assert explicit.life_publish_timezone == "UTC+08:00"
+    assert explicit.life_publish_image_style_prompt == ""
 
 
 @pytest.mark.parametrize(
@@ -337,6 +363,8 @@ def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeyp
         ("qzone_bridge.settings", "PluginSettings", "persona_consistency_check"),
         ("qzone_bridge.settings", "PluginSettings", "life_publish_inherit_persona_visual"),
         ("qzone_bridge.settings", "PluginSettings", "life_publish_persona_visual_prompt"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_timezone"),
+        ("qzone_bridge.settings", "PluginSettings", "life_publish_image_style_prompt"),
         ("qzone_bridge.settings", "PluginSettings", "auto_reply_enabled"),
         ("qzone_bridge.settings", "PluginSettings", "auto_reply_poll_interval"),
         ("qzone_bridge.settings", "PluginSettings", "auto_reply_delay_min"),
@@ -480,6 +508,8 @@ def test_main_import_recovers_from_stale_settings_without_required_fields(
         "life_publish_extra_params",
         "life_publish_static_caption",
         "life_publish_image_prompt_template",
+        "life_publish_timezone",
+        "life_publish_image_style_prompt",
         "life_publish_caption_prompt",
     }
     fields.discard(missing_field)
@@ -7811,11 +7841,11 @@ def test_auto_publish_once_uses_life_scheduler_and_omnidraw_selfie_return_result
     async def fake_ready(*args, **kwargs):
         return None
 
-    async def fake_generate_prompt(event, life_context):
+    async def fake_generate_prompt(event, life_context, **kwargs):
         captured["life_context"] = life_context
         return "坐在咖啡厅窗边看书，白色毛衣和牛仔裙，手机自拍"
 
-    async def fake_caption(event, *, life_context, image_prompt):
+    async def fake_caption(event, *, life_context, image_prompt, **kwargs):
         captured["caption_args"] = (life_context, image_prompt)
         return "下午在咖啡香里偷一点安静。"
 
@@ -7922,12 +7952,12 @@ def test_auto_life_publish_accepts_manual_event_and_force_publishes(
     async def fake_daemon(*args, **kwargs):
         return None
 
-    async def fake_generate_prompt(event, life_context):
+    async def fake_generate_prompt(event, life_context, **kwargs):
         captured["prompt_event"] = event
         captured["life_context"] = life_context
         return "傍晚散步时的自然手机自拍"
 
-    async def fake_caption(event, *, life_context, image_prompt):
+    async def fake_caption(event, *, life_context, image_prompt, **kwargs):
         captured["caption_event"] = event
         return "晚风刚刚好。"
 
@@ -8157,13 +8187,16 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
 
     prompt = asyncio.run(plugin._generate_life_image_prompt(None, "今日穿搭：浅色卫衣\n今日日程：傍晚散步"))
 
-    assert "真实手机自拍" in prompt
-    assert "浅色卫衣" in prompt
-    assert "傍晚散步" in prompt
+    assert "人物近景" in prompt
+    assert "浅色卫衣" not in prompt
+    assert "傍晚散步" not in prompt
+    assert "来源日期：未知" in prompt
+    assert "<画风约束>" in prompt
+    assert "日系二次元厚涂插画" in captured["prompt"]
     assert prompt.count("<视觉参考>") == 1
     assert captured["prompt"].startswith("根据日程生成自拍")
     assert captured["event"] is not None
-    assert "今日日程明确要求的服装与姿势优先" in captured["system_prompt"]
+    assert "不得从过去或未来日程推断" in captured["system_prompt"]
 
     echoed = plugin._assemble_life_image_prompt(
         "黑发，今天穿浅色卫衣。黑发。<视觉参考>\n黑发\n</视觉参考>", "黑发"
@@ -8176,7 +8209,7 @@ def test_life_image_prompt_falls_back_when_llm_returns_empty(monkeypatch: pytest
     assert assembled.startswith(negative)
     assert assembled.count("<视觉参考>") == 1
     assert "不穿白衬衫" in assembled
-    assert "今日日程明确要求的服装和姿势优先" in assembled
+    assert "当前穿着和姿势未知" in assembled
 
 
 def test_life_image_prompt_static_mode_skips_persona_provider_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -8192,7 +8225,149 @@ def test_life_image_prompt_static_mode_skips_persona_provider_resolution(monkeyp
     })
     plugin.llm = main.QzoneLLM(None, plugin.settings)
     prompt = asyncio.run(plugin._generate_life_image_prompt(None, "今天散步"))
-    assert prompt == "静态模板：今天散步"
+    assert prompt.startswith("静态模板：")
+    assert "今天散步" not in prompt  # direct helper lacks a frozen dated projection
+    assert "来源日期：未知" in prompt
+    assert "<画风约束>" in prompt
+
+
+def test_life_operation_freezes_clock_style_and_projection_before_scheduler_await(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from datetime import timezone
+
+    import qzone_bridge.life_context as life_context_module
+
+    main = _import_main_with_stubs(monkeypatch)
+    frozen_utc = datetime(2026, 11, 5, 12, 30, tzinfo=timezone.utc)
+    real_capture = life_context_module.capture_life_inputs
+    monkeypatch.setattr(main, "capture_life_inputs", lambda zone, style: real_capture(zone, style, utc_now=frozen_utc))
+    captured = {}
+
+    class Life:
+        async def get_life_context(self):
+            plugin.settings.life_publish_timezone = "UTC"
+            plugin.settings.life_publish_image_style_prompt = "MUTATED_STYLE"
+            return {
+                "date": "2026-11-05",
+                "timeline": [{"time": "20:00-22:00", "content": "回家后休息"}],
+            }
+
+    class Metadata:
+        def __init__(self, star_cls): self.star_cls = star_cls
+
+    class Context:
+        def get_registered_star(self, name):
+            return Metadata(Life()) if name == "astrbot_plugin_life_scheduler" else None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({"life_publish": {"enabled": True, "image_style_prompt": "FROZEN_STYLE"}})
+    plugin._context = Context()
+    plugin.data_dir = tmp_path
+
+    async def image_prompt(event, life_context, *, projection, style_prompt):
+        captured["image_projection"] = projection
+        captured["style"] = style_prompt
+        captured["image_context"] = life_context
+        return main.QzoneStablePlugin._assemble_life_image_prompt(
+            "自拍构图", "", temporal_context=projection.image_context(),
+            style_prompt=style_prompt, current_plan_supported=projection.current_plan is not None,
+        )
+
+    async def media(event, prompt):
+        return [main.PostMedia(kind="image", source="fixture.png", trusted_local=True)], {"success": True}
+
+    async def caption(event, *, life_context, image_prompt, projection):
+        captured["caption_projection"] = projection
+        captured["caption_context"] = life_context
+        captured["image_action"] = image_prompt
+        return "caption"
+
+    plugin._generate_life_image_prompt = image_prompt
+    plugin._generate_life_selfie_media = media
+    plugin._generate_life_caption = caption
+    prepared = asyncio.run(plugin._auto_life_publish_once_scoped())
+    projection = captured["image_projection"]
+    assert prepared is not None
+    assert projection is captured["caption_projection"]
+    assert projection.timezone_label == "Asia/Shanghai"
+    assert projection.local_now.strftime("%Y-%m-%d %H:%M") == "2026-11-05 20:30"
+    assert projection.current_plan is not None
+    assert captured["style"] == "FROZEN_STYLE"
+    assert "FROZEN_STYLE" in captured["image_action"]
+    assert "MUTATED_STYLE" not in captured["image_action"]
+    assert "2026-11-05 20:30" in captured["caption_context"]
+
+
+def test_invalid_life_timezone_stops_before_scheduler_provider_or_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    from qzone_bridge.life_context import LifeTimezoneError
+
+    called = {"scheduler": 0, "provider": 0, "send": 0}
+
+    class Context:
+        def get_registered_star(self, _name):
+            called["scheduler"] += 1
+            return None
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({"life_publish": {"timezone": "Mars/Olympus"}})
+    plugin._context = Context()
+    async def provider(*args, **kwargs):
+        called["provider"] += 1
+    async def send(*args, **kwargs):
+        called["send"] += 1
+    plugin._generate_life_image_prompt = provider
+    plugin._generate_life_caption = provider
+    plugin._publish_or_draft_scheduled_post = send
+    with pytest.raises(LifeTimezoneError):
+        asyncio.run(plugin._auto_life_publish_once_scoped())
+    assert called == {"scheduler": 0, "provider": 0, "send": 0}
+
+
+def test_custom_life_templates_without_placeholders_receive_same_temporal_facts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import timezone
+
+    import qzone_bridge.life_context as life_context_module
+
+    main = _import_main_with_stubs(monkeypatch)
+    projection = life_context_module.project_life_context(
+        {"date": "2026-11-05", "timeline": [{"time": "20:00-22:00", "content": "回家后休息"}]},
+        life_context_module.capture_life_inputs(
+            "Asia/Shanghai", "FROZEN_STYLE",
+            utc_now=datetime(2026, 11, 5, 12, 30, tzinfo=timezone.utc),
+        ).clock,
+    )
+    captured = {}
+
+    class LLM:
+        async def prepare_persona_snapshot(self, event, **kwargs):
+            return {}
+        async def generate_persona_visual_projection(self, event, **kwargs):
+            return ""
+        async def generate_text(self, event, prompt, **kwargs):
+            captured["image_prompt"] = prompt
+            return "自拍构图"
+        async def generate_guarded_text(self, event, prompt, **kwargs):
+            captured["caption_prompt"] = prompt
+            captured["task_context"] = kwargs["task_context"]
+            captured["authoritative_facts"] = kwargs["authoritative_facts"]
+            return "caption"
+
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = PluginSettings.from_mapping({"life_publish": {
+        "image_prompt_template": "自定义图片模板，不含变量。",
+        "caption_prompt": "自定义配文模板，不含变量。",
+        "image_style_prompt": "FROZEN_STYLE",
+    }})
+    plugin._context = types.SimpleNamespace()
+    plugin._llm_adapter = lambda: LLM()
+    action = asyncio.run(plugin._generate_life_image_prompt(None, "ignored", projection=projection))
+    asyncio.run(plugin._generate_life_caption(None, life_context="ignored", image_prompt=action, projection=projection))
+    stamp = "2026-11-05 20:30"
+    assert stamp in captured["image_prompt"] and "来源日期：2026-11-05（本地当天）" in captured["image_prompt"]
+    assert "FROZEN_STYLE" in captured["image_prompt"]
+    assert stamp in captured["caption_prompt"] and projection.caption_time_rules() in captured["caption_prompt"]
+    assert stamp in captured["task_context"] and projection.caption_time_rules() in captured["task_context"]
+    assert stamp in captured["authoritative_facts"] and projection.caption_time_rules() in captured["authoritative_facts"]
 
 
 @pytest.mark.parametrize("failure_policy", ["skip", "text_only"])
@@ -8352,7 +8527,7 @@ def test_real_life_guard_publishes_approved_caption_with_validated_visual_refere
     assert len(captured["post"].media) == 1
     assert "<视觉参考>" in captured["action"] and captured["action"].count("<视觉参考>") == 1
     assert "black hair" in captured["action"] and "silver earrings" in captured["action"]
-    assert "今日日程明确要求的服装和姿势优先" in captured["action"]
+    assert "当前穿着和姿势未知" in captured["action"]
     assert len(provider.calls) == 4
 
 
@@ -8362,7 +8537,7 @@ def test_life_visual_assembly_preserves_negation_and_deduplicates_only_owned_con
     result = main.QzoneStablePlugin._assemble_life_image_prompt(text, "白衬衫")
     assert result.startswith("今天穿蓝色卫衣，不穿白衬衫，保持当前动作姿态。")
     assert result.count("<视觉参考>") == 1
-    assert "今日日程明确要求的服装和姿势优先" in result
+    assert "当前穿着和姿势未知" in result
 
 
 def test_life_publish_generation_scope_ends_before_publish_or_notify(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -8628,7 +8803,7 @@ def test_auto_life_publish_skip_policy_does_not_publish_when_omnidraw_missing(
     async def fake_ready(*args, **kwargs):
         return None
 
-    async def fake_generate_prompt(event, life_context):
+    async def fake_generate_prompt(event, life_context, **kwargs):
         return "在家看书的自拍"
 
     plugin = object.__new__(main.QzoneStablePlugin)

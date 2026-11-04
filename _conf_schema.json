@@ -261,6 +261,18 @@
         "default": false,
         "hint": "开启后，trigger.publish_cron 触发时会读取 Life Scheduler 日程、让 LLM 写自拍提示词、调用 OmniDraw generate_selfie(return_result=true) 取图，再发说说或存草稿。关闭时沿用原纯文本定时发说说。"
       },
+      "timezone": {
+        "description": "生活日程时区",
+        "type": "string",
+        "default": "Asia/Shanghai",
+        "hint": "用于判断日程当前/过去/未来；可填 IANA 名称（如 Asia/Shanghai）或 UTC+08:00。无效时区会中止本次 Life 任务。"
+      },
+      "image_style_prompt": {
+        "description": "Life 图片画风约束",
+        "type": "text",
+        "default": "日系二次元厚涂插画，细腻笔触与自然柔和的明暗塑造，保留角色五官、发丝和配饰细节；采用自拍或生活随手构图，不作真人摄影或写实皮肤质感，不强制平涂赛璐璐，不改变角色原有形象",
+        "hint": "作为提示词级画风要求，不保证具体模型或成图完全遵循；留空关闭新增画风约束。"
+      },
       "use_life_context": {
         "description": "读取 Life Scheduler 日程",
         "type": "bool",
@@ -330,13 +342,13 @@
       "image_prompt_template": {
         "description": "自拍提示词模板",
         "type": "text",
-        "default": "根据今日日程和穿搭，写一段适合 OmniDraw 自拍模式的生图提示词。画面要像真实手机自拍或日常随手拍，包含场景、动作、服装、光线和氛围。\\n\\n{life_context}",
+        "default": "为人物生成自然的自拍或生活随手构图提示，结合有依据的当前场景，不推断未知活动或地点。\\n\\n{life_context}",
         "hint": "支持 {life_context} 占位符。"
       },
       "caption_prompt": {
         "description": "配文提示词模板",
         "type": "text",
-        "default": "根据今日日程和自拍画面，写一条适合 QQ 空间发布的简短说说。自然、有生活感，不要解释。\\n\\n日程上下文：\\n{life_context}\\n\\n自拍提示词：\\n{image_prompt}",
+        "default": "根据给定日期的生活日程和自拍画面，写一条适合 QQ 空间发布的简短说说。自然、有生活感，不要解释。\\n\\n日程上下文：\\n{life_context}\\n\\n自拍提示词：\\n{image_prompt}",
         "hint": "支持 {life_context} 和 {image_prompt} 占位符。"
       },
       "inherit_persona_visual": {

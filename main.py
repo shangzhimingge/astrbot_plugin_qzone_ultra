@@ -36,7 +36,7 @@ except Exception:
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
-REQUIRED_QZONE_BRIDGE_API_VERSION = 2026110403
+REQUIRED_QZONE_BRIDGE_API_VERSION = 2026110501
 LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json", "auto_comment_state.json")
 LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
 LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
@@ -544,6 +544,10 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                     return False
 
     contract_attributes = {
+        "qzone_bridge.life_context": (
+            "capture_life_inputs", "project_life_context", "unknown_life_context",
+            "LifeTimezoneError", "LifeOperationInputs", "LifeContextProjection",
+        ),
         "qzone_bridge.media": (
             "base64_media_source",
             "collapse_single_video_cover_companion_media",
@@ -617,6 +621,8 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                 "life_publish_extra_params",
                 "life_publish_static_caption",
                 "life_publish_image_prompt_template",
+                "life_publish_timezone",
+                "life_publish_image_style_prompt",
                 "life_publish_caption_prompt",
                 "persona_id",
                 "context_umo",
@@ -665,6 +671,11 @@ def _qzone_bridge_contract_is_current(package_root: Path) -> bool:
                     return False
 
     signature_contracts = {
+        "qzone_bridge.life_context": {
+            "capture_life_inputs": ("timezone_label", "image_style_prompt", "utc_now"),
+            "project_life_context": ("data", "clock"),
+            "unknown_life_context": ("clock",),
+        },
         "qzone_bridge.controller": {"QzoneDaemonController.list_feeds": "record_recent"},
         "qzone_bridge.daemon": {"QzoneDaemonService.list_feeds": "record_recent"},
         "qzone_bridge.page_api": {
@@ -817,6 +828,7 @@ from qzone_bridge.onebot_cookie import (
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.page_api import QzonePageApi, page_error_payload
 from qzone_bridge.page_media import open_page_media_stream
+from qzone_bridge.life_context import capture_life_inputs, project_life_context, unknown_life_context
 from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
 from qzone_bridge.video import materialize_video_covers, materialize_video_sources
@@ -4273,7 +4285,7 @@ class QzoneStablePlugin(Star):
             data = {}
         if not isinstance(data, dict):
             text = self._life_context_text(data)
-            return {"raw": data}, text
+            return data, text
         return data, self._life_context_text(data)
 
     @staticmethod
@@ -4293,31 +4305,38 @@ class QzoneStablePlugin(Star):
         return cleaned.strip()
 
     @staticmethod
-    def _fallback_life_image_prompt(life_context: str) -> str:
-        context = QzoneStablePlugin._clean_life_publish_text(life_context) or "今日份日常生活"
-        return f"真实手机自拍，{context}，自然光线，生活感场景，构图自然，画面清晰。"
+    def _fallback_life_image_prompt(life_context: str = "") -> str:
+        return "自然的生活随手构图，人物近景，表情与姿态放松，背景简洁，不推断具体地点或活动。"
 
     @staticmethod
-    def _assemble_life_image_prompt(text: str, visual_reference: str) -> str:
+    def _assemble_life_image_prompt(text: str, visual_reference: str, *, temporal_context: str = "本次生成时间：未知\n当前活动：未知。", style_prompt: str = "", current_plan_supported: bool = False) -> str:
         cleaned = QzoneStablePlugin._clean_life_publish_text(text)
         visual = str(visual_reference or "").strip()
-        if not visual:
-            return cleaned
-        cleaned = re.sub(r"<视觉参考>.*?</视觉参考>", "", cleaned, flags=re.DOTALL)
-        visual_block = (
-            "<视觉参考>\n"
-            f"{visual}\n"
-            "固定外貌与配饰作为基准；今日日程明确要求的服装和姿势优先。\n"
-            "</视觉参考>"
-        )
-        return f"{cleaned.rstrip()}\n\n{visual_block}".strip()
+        for block in ("时间信息", "画风约束", "视觉参考"):
+            cleaned = re.sub(rf"<{block}>.*?</{block}>", "", cleaned, flags=re.DOTALL)
+        blocks = [f"<时间信息>\n{temporal_context.strip()}\n</时间信息>"]
+        if str(style_prompt or "").strip():
+            blocks.append(f"<画风约束>\n{str(style_prompt).strip()}\n</画风约束>")
+        if visual:
+            precedence = ("当前明确覆盖时段的计划可决定该时段服装与姿势；" if current_plan_supported else
+                "当前穿着和姿势未知；固定外貌与配饰作为基准，不从过期或未来日程推断。")
+            blocks.append(f"<视觉参考>\n{visual}\n{precedence}\n</视觉参考>")
+        return "\n\n".join(part for part in (cleaned.rstrip(), *blocks) if part).strip()
 
-    async def _generate_life_image_prompt(self, event: AstrMessageEvent | None, life_context: str) -> str:
+    async def _generate_life_image_prompt(self, event: AstrMessageEvent | None, life_context: str, *, projection: Any = None, style_prompt: str | None = None) -> str:
+        projection = projection or unknown_life_context()
+        style_prompt = str(getattr(self.settings, "life_publish_image_style_prompt", "") if style_prompt is None else style_prompt)
+        image_context = projection.image_context()
         template = str(getattr(self.settings, "life_publish_image_prompt_template", "") or "").strip()
-        prompt = self._format_life_prompt_template(template, life_context=life_context).strip()
-        fallback_prompt = self._fallback_life_image_prompt(life_context)
+        prompt = self._format_life_prompt_template(template, life_context=image_context).strip()
+        fallback_prompt = self._fallback_life_image_prompt(image_context)
         if not prompt:
             prompt = fallback_prompt
+        if image_context not in prompt:
+            prompt = f"{prompt}\n\n<时间信息>\n{image_context}\n</时间信息>"
+        prompt = f"{prompt}\n\n当前场景依据：\n{projection.image_scene_context()}".strip()
+        if style_prompt.strip():
+            prompt += f"\n\n画风约束（保持构图动作意图，不覆盖角色原貌）：\n{style_prompt.strip()}"
         call_event = event or self._scheduled_plugin_event(prompt=prompt)
         llm = self._llm_adapter()
         use_llm_prompt = bool(getattr(self.settings, "life_publish_use_llm_image_prompt", True))
@@ -4333,12 +4352,13 @@ class QzoneStablePlugin(Star):
         visual_suffix = f"\n\n<视觉参考>\n{visual_reference}\n</视觉参考>" if visual_reference else ""
         if not use_llm_prompt:
             cleaned = self._clean_life_publish_text(prompt, fallback=fallback_prompt) or fallback_prompt
-            return self._assemble_life_image_prompt(cleaned, visual_reference)
+            return self._assemble_life_image_prompt(cleaned, visual_reference, temporal_context=image_context,
+                style_prompt=style_prompt, current_plan_supported=projection.current_plan is not None)
         system_prompt = (
             "你是给 OmniDraw 自拍模式写画面动作/场景提示词的助手。"
             "只输出最终提示词，不要输出 JSON、解释、标题或编号。"
-            "提示词要适合 generate_selfie：包含动作、场景、穿搭、光线、构图和生活氛围。"
-            "<视觉参考>中的固定外貌、配饰细节需保留；今日日程明确要求的服装与姿势优先于基准穿搭。"
+            "提示词要适合 generate_selfie：包含动作、构图和生活氛围；场景仅依据明确的当前时段计划，未知时采用中性人物近景。"
+            "服装姿势不得从过去或未来日程推断；采用给定画风约束并保留视觉参考中的固定外貌与配饰。"
         )
         prompt = f"{prompt}{visual_suffix}"
         text = await llm.generate_text(
@@ -4351,10 +4371,12 @@ class QzoneStablePlugin(Star):
         )
         cleaned = self._clean_life_publish_text(text)
         if cleaned:
-            return self._assemble_life_image_prompt(cleaned, visual_reference)
+            return self._assemble_life_image_prompt(cleaned, visual_reference, temporal_context=image_context,
+                style_prompt=style_prompt, current_plan_supported=projection.current_plan is not None)
         fallback = self._clean_life_publish_text(fallback_prompt, fallback=fallback_prompt) or fallback_prompt
         logger.debug("qzone life publish image prompt fell back to template prompt")
-        return self._assemble_life_image_prompt(fallback, visual_reference)
+        return self._assemble_life_image_prompt(fallback, visual_reference, temporal_context=image_context,
+            style_prompt=style_prompt, current_plan_supported=projection.current_plan is not None)
 
     async def _generate_life_caption(
         self,
@@ -4362,6 +4384,7 @@ class QzoneStablePlugin(Star):
         *,
         life_context: str,
         image_prompt: str,
+        projection: Any = None,
     ) -> str:
         static_caption = str(getattr(self.settings, "life_publish_static_caption", "") or "").strip()
         if not getattr(self.settings, "life_publish_auto_caption", True):
@@ -4371,6 +4394,16 @@ class QzoneStablePlugin(Star):
             prompt = template.format(life_context=life_context, image_prompt=image_prompt)
         except Exception:
             prompt = f"{template}\n\n日程上下文：\n{life_context}\n\n自拍提示词：\n{image_prompt}"
+        time_rules = projection.caption_time_rules() if projection is not None else "过去只能明确写作回顾，未来只能写作计划；未知时不得推断当前活动。"
+        caption_facts = ""
+        if projection is not None:
+            caption_facts = projection.caption_context()
+            if caption_facts not in life_context:
+                life_context = f"{life_context}\n\n{caption_facts}"
+        if caption_facts and caption_facts not in prompt:
+            prompt = f"{prompt}\n\n权威时间上下文：\n{caption_facts}"
+        if time_rules not in prompt:
+            prompt = f"{prompt}\n\n{time_rules}"
         system_prompt = (
             "你是 QQ 空间说说文案助手。只输出最终可发布的简短中文说说，"
             "不要解释，不要输出 JSON/Markdown/标题，语气自然有生活感。"
@@ -4382,8 +4415,8 @@ class QzoneStablePlugin(Star):
             system_prompt=system_prompt,
             prefer_current_provider=True,
             normalizer=lambda value: self._clean_life_publish_text(value),
-            task_context=template,
-            authoritative_facts=f"life_context={life_context}\nimage_prompt={image_prompt}",
+            task_context=f"{template}\n\n权威时间上下文：\n{caption_facts}\n\n{time_rules}",
+            authoritative_facts=f"life_context={life_context}\nimage_prompt={image_prompt}\ntime_rules={time_rules}",
             format_contract="Nonempty concise Chinese QQ Zone caption; only final publishable text following the configured caption instructions.",
             fallback_text=static_caption,
         )
@@ -4660,6 +4693,12 @@ class QzoneStablePlugin(Star):
         force_publish: bool = False,
         notify_admin: bool = True,
     ) -> tuple[PostPayload, list[str], bool] | None:
+        # Freeze time and rendering style before any external scheduler lookup or await.
+        operation_inputs = capture_life_inputs(
+            getattr(self.settings, "life_publish_timezone", "Asia/Shanghai"),
+            getattr(self.settings, "life_publish_image_style_prompt", ""),
+        )
+        projection = unknown_life_context(operation_inputs.clock)
         logger.info(
             "qzone scheduled life publish started event=%s force_publish=%s mode=%s failure_policy=%s use_life_context=%s use_llm_image_prompt=%s use_omnidraw_selfie=%s auto_caption=%s image_retry_count=%s",
             bool(event),
@@ -4675,19 +4714,24 @@ class QzoneStablePlugin(Star):
         life_data: dict[str, Any] = {}
         try:
             life_data, life_context = await self._get_life_context()
+            projection = project_life_context(life_data, operation_inputs.clock)
+            life_context = projection.caption_context()
         except Exception as exc:
             if getattr(self.settings, "life_publish_use_life_context", True):
                 logger.warning("qzone scheduled life publish skipped: life context failed: %s", exc)
                 if self.settings.life_publish_failure_policy != "text_only":
                     return
-            life_context = "暂无今日生活日程。"
+            life_context = projection.caption_context()
 
         image_prompt = ""
         media: list[PostMedia] = []
         omnidraw_result: dict[str, Any] = {"success": False, "images": []}
         image_flow_failed = False
         try:
-            image_prompt = await self._generate_life_image_prompt(event, life_context)
+            image_prompt = await self._generate_life_image_prompt(
+                event, life_context, projection=projection,
+                style_prompt=operation_inputs.image_style_prompt,
+            )
             if not image_prompt.strip():
                 raise RuntimeError("LLM 未生成自拍提示词")
             media, omnidraw_result = await self._generate_life_selfie_media(event, image_prompt)
@@ -4702,7 +4746,9 @@ class QzoneStablePlugin(Star):
                 return
 
         try:
-            caption = await self._generate_life_caption(event, life_context=life_context, image_prompt=image_prompt)
+            caption = await self._generate_life_caption(
+                event, life_context=life_context, image_prompt=image_prompt, projection=projection
+            )
         except Exception as exc:
             logger.warning("qzone scheduled life publish caption failed")
             if isinstance(exc, PersonaConsistencyError):
