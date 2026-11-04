@@ -1,0 +1,23 @@
+# Qzone Persona, automatic replies, and Page AI drafts
+
+## Objective
+Implement the independently tracked #108 and #109 behavior on `feature/persona-auto-reply-webui`, plus safe AI comment/reply draft buttons in the existing AstrBot Pages UI. Preserve existing manual actions and authenticated page routes. No live Qzone calls, credentials, production-user profile, push, or PR in this task.
+
+## Acceptance
+1. LLM text generation resolves AstrBot's selected Persona for incoming event UMO/conversation (including session-forced, conversation-selected, provider default, and `[%None]` disable); context-free scheduled/Page generation can explicitly use configured `llm.persona_id`, otherwise uses the management-group/admin UMO selection fallback, and visibly surfaces invalid explicit IDs. Personas are not cached. Actual Persona system text is composed with task system prompt exactly once for post/news/comment/reply/life caption. Image prompt generation remains `inherit_persona=False`. Provider compatibility must not silently drop the composed system prompt.
+2. Optional auto-reply is disabled by default. One cancellable serialized polling task enumerates only current own recent posts, establishes a persisted first-success watermark, and fetches fresh detail/comments before generating/sending. It excludes own comments, missing identities, ignored users, configured low-information comments, nested already-answered comments, and preactivation comments; persists bounded durable per-comment state and daily budget; uses bounded delay/quota and pre-send revalidation. Existing manual and WebUI replies share per-comment send lock. LLM/presend errors retry; confirmed sends complete; uncertain transport outcomes stay uncertain and are not retried automatically. No exactly-once claim.
+3. Authenticated Pages POST `/page/ai-comment` and `/page/ai-reply` use QzonePageApi with injected generation callbacks. Inputs: `{id, content?}` for comment and `{id, commentid, comment_uin}` for reply; identity and context are loaded server-side from uncached `detail_feed`; no client prompt/content/nickname is trusted. Success `{ok:true,data:{content}}`; errors use current redacted API envelope/status. Requests bounded by timeout/concurrency. Existing modern and legacy route authentication remain intact.
+4. Buttons in current comment and inline reply forms use stable accessible names `AI 生成评论` and `AI 生成回复`, populate editable draft only, and never submit automatically. Disable during request; accessible busy/error status; preserve user edits on failure; discard stale response after target/navigation changes; render model text via value/textContent.
+5. Tests cover resolver variants, polling state and failures, Page authorization through existing route framework (without weakening it), API validation and fixture generation, DOM behavior. Docs specify settings, first scan, uncertain outcomes and Page draft flow.
+
+## API/contracts
+- Resolver async function accepts AstrBot context, event/UMO or `context_free`, and `settings`; return Persona prompt text or empty when disabled/no Persona. Modern `resolve_selected_persona` is preferred; verified legacy fallback only.
+- QzoneLLM `generate_text(..., inherit_persona=True)` composes exactly one effective system prompt. Existing calls remain source compatible.
+- AutoReplyService owns task lifecycle, persistence (`AtomicItemStoreFile` transaction), account watermark and send coordination; it calls existing controller for own-feed/detail/reply.
+- Page AI callbacks injected into QzonePageApi; POST routes use current authenticated plugin namespace and existing `page_error_payload` mapping.
+
+## Defaults / boundaries
+Auto-reply: `enabled=false`, poll 120 sec, randomized delay 30–180 sec, 5 recent posts, max 2 per run, daily max 20, skip low-information true, probability 0.8, ignored user list empty. Validate finite ranges. Keep image prompt Persona inheritance off. Do not redesign auth, daemon, transport or app framework; do not add dependencies.
+
+## Baseline
+Initial `python -m pytest -vv --maxfail=1` hit a sandbox Temp `tmp_path` setup error. Retrying with TEMP/TMP under task output got through 9 tests then stalled at `test_qzone_client_h5_video_upload_posts_control_and_slices` for >60 seconds and was interrupted. Reproduce that individual test with time bound; treat as pre-existing only with confirming baseline evidence.
