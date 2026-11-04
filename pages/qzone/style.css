@@ -958,6 +958,9 @@ button:active {
 
 .reply-form {
   grid-column: 2 / -1;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -987,15 +990,26 @@ button:active {
 
 .reply-form-actions {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
 }
 
 .reply-form-actions button {
+  flex: 0 0 auto;
+  white-space: nowrap;
   padding: 8px 16px;
   border-radius: var(--radius-full);
   font-weight: 600;
   font-size: 13px;
+}
+
+.reply-form-actions .ai-draft-status {
+  flex: 1 0 100%;
+  min-width: 0;
+  white-space: normal;
+  text-align: right;
 }
 
 .reply-form-actions .primary {
@@ -1177,6 +1191,9 @@ button:active {
 
 
 @media (max-width: 768px) {
+  .reply-form {
+    grid-column: 1 / -1;
+  }
   .shell {
     display: flex;
     flex-direction: column;

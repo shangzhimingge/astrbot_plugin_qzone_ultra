@@ -75,6 +75,20 @@ def test_page_feed_renders_normalized_media_and_source_downloads() -> None:
     assert '"qzone-emoji nickname-emoji"' in app
 
 
+def test_ai_draft_buttons_are_accessible_and_inline_reply_actions_remain_tappable() -> None:
+    app = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
+    css = (ROOT / "pages" / "qzone" / "style.css").read_text(encoding="utf-8")
+
+    assert 'setAttribute("aria-label", "AI 生成评论")' in app
+    assert 'setAttribute("aria-label", "AI 生成回复")' in app
+    assert 'apiPost("page/ai-comment"' in app
+    assert 'apiPost("page/ai-reply"' in app
+    assert ".reply-form-actions {\n  display: flex;\n  flex-wrap: wrap;" in css
+    assert ".reply-form-actions button {\n  flex: 0 0 auto;\n  white-space: nowrap;" in css
+    assert ".reply-form-actions .ai-draft-status {\n  flex: 1 0 100%;" in css
+    assert "grid-column: 1 / -1;" in css
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required for the frontend smoke test")
 def test_page_frontend_reply_uses_inline_form_and_cached_detail(tmp_path: Path) -> None:
     harness = tmp_path / "qzone_page_harness.mjs"
@@ -278,6 +292,8 @@ const windowHandlers = new Map();
 let promptCalls = 0;
 let confirmCalls = 0;
 let replyPayload = null;
+let commentPayload = null;
+let rejectComment;
 let deletePayload = null;
 let publishPayload = null;
 let detailResolve;
@@ -358,6 +374,10 @@ globalThis.window = {
             author: { uin: 10001, nickname: "" },
           },
         });
+      }
+      if (endpoint === "page/comment") {
+        commentPayload = body;
+        return new Promise((resolve, reject) => { rejectComment = reject; });
       }
       if (endpoint === "page/delete") {
         deletePayload = body;
@@ -475,6 +495,31 @@ if (!replyPayload || replyPayload.commentid !== "comment-1" || replyPayload.cont
 }
 if (!byText(elements.get("detailContent"), "Tester")) {
   throw new Error("self reply did not reuse the current nickname");
+}
+
+let commentForm = elements.get("detailContent").querySelector(".comment-form");
+let commentInput = commentForm?.querySelector("textarea");
+let commentSubmit = byText(commentForm, "发送");
+if (!commentForm || !commentInput || !commentSubmit) throw new Error("comment form was not rendered");
+commentInput.value = "draft kept after failure";
+commentInput.handlers.input?.();
+const pendingComment = commentForm.handlers.submit({ preventDefault() {} });
+commentForm = elements.get("detailContent").querySelector(".comment-form");
+commentInput = commentForm?.querySelector("textarea");
+commentSubmit = byText(commentForm, "发送");
+if (!commentSubmit?.disabled || commentInput?.value !== "draft kept after failure") {
+  throw new Error("comment submit busy state/draft did not survive optimistic DOM rebuild");
+}
+if (!commentPayload || commentPayload.content !== "draft kept after failure") {
+  throw new Error(`comment request payload was wrong: ${JSON.stringify(commentPayload)}`);
+}
+rejectComment(new Error("fixture comment send failure"));
+await pendingComment;
+commentForm = elements.get("detailContent").querySelector(".comment-form");
+commentInput = commentForm?.querySelector("textarea");
+commentSubmit = byText(commentForm, "发送");
+if (commentSubmit?.disabled || commentInput?.value !== "draft kept after failure") {
+  throw new Error("comment failure lost draft or kept form busy after DOM rebuild");
 }
 
 detailResolve({

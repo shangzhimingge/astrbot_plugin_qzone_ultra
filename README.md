@@ -6,6 +6,12 @@ QQ空间Ultra 是一个面向 AstrBot 的 QQ 空间插件，提供中文命令�
 
 交流与反馈：**[点击加入 QQ 群 1081773675](https://qm.qq.com/q/Qr45Vz0a8o)**
 
+本 Fork 的可安装源码仓库为 [shangzhimingge/astrbot_plugin_qzone_ultra](https://github.com/shangzhimingge/astrbot_plugin_qzone_ultra)。本页标出的 Fork 增量功能是本仓库维护的改动；上游来源与致谢见上文。
+
+## 此 Fork 的增量功能
+
+以下是此 Fork 新增的功能，不代表上游仓库已有同样实现：LLM 文本生成继承 AstrBot 当前选中人格；Pages 中“AI 生成评论/回复”只生成可编辑草稿，不会自动提交；可选的“自动回复自己说说的新评论”默认关闭，启用后首次成功扫描会先为现有评论建立基线，并对发送前再次确认的新增评论执行限额回复。自动回评状态保存在插件数据目录 `auto_reply_state.json`；遇到发送结果不确定时会保留状态并避免自动重发。
+
 ## 亮点：自动发布「会生活」的日常说说
 
 QzoneUltra 现在可以把 **Life Scheduler 日程插件** 和 **OmniDraw 自拍生成** 串起来，自动把当天行程变成一条更像真人日常的 QQ 空间说说：先读取日程上下文，再由 LLM 生成适合自拍模式的画面提示词，调用 OmniDraw `generate_selfie(return_result=true)` 取回图片，最后自动配文并发布到 QQ 空间，或按配置先写入草稿。特别感谢木有知大佬的日程插件 [muyouzhi6/astrbot_plugin_life_scheduler](https://github.com/muyouzhi6/astrbot_plugin_life_scheduler)，推荐搭配安装使用，让自动说说能真正基于每天的日程和生活上下文生成。
@@ -40,7 +46,7 @@ QzoneUltra 现在可以把 **Life Scheduler 日程插件** 和 **OmniDraw 自拍
 
 要求 AstrBot `>=4.16,<5`。
 
-1. 将本仓库放入 AstrBot 的插件目录，例如 `data/plugins/astrbot_plugin_qzone_ultra`。
+1. 在 AstrBot 插件管理中使用 Fork 仓库地址 `https://github.com/shangzhimingge/astrbot_plugin_qzone_ultra` 安装；或将本仓库放入插件目录，例如 `data/plugins/astrbot_plugin_qzone_ultra`。
 2. 在插件目录安装依赖：
 
 ```bash
@@ -161,6 +167,15 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `llm.news_provider_id` | 空 | 新闻说说使用的 LLM provider；空时优先回退写说说 provider |
 | `llm.comment_provider_id` | 空 | 评论使用的 LLM provider |
 | `llm.reply_provider_id` | 空 | 回评使用的 LLM provider |
+| `llm.persona_id` | 空 | 此 Fork 中仅用于定时/Pages 等无会话上下文生成；留空时沿用 AstrBot 当前选中人格 |
+| `auto_reply.enabled` | `false` | 此 Fork 的自说说新增评论自动回复开关；默认关闭 |
+| `auto_reply.poll_interval` | `120` | 自动回评轮询间隔（秒） |
+| `auto_reply.delay_min` / `auto_reply.delay_max` | `30` / `180` | 自动回评发送前随机等待范围（秒） |
+| `auto_reply.recent_posts` | `5` | 每轮检查自己的最近说说数量 |
+| `auto_reply.max_per_run` | `2` | 每轮最多回复数 |
+| `auto_reply.daily_limit` | `20` | 每日自动回评预留额度 |
+| `auto_reply.reply_probability` | `0.8` | 对符合条件的新评论进行回复的概率 |
+| `auto_reply.ignore_users` | 空 | 自动回评忽略的 QQ 号或昵称列表 |
 | `trigger.publish_cron` | 空 | 自动发说说 cron 表达式；空表示关闭 |
 | `trigger.news_cron` | 空 | Google News RSS 新闻自动发说说 cron 表达式；空表示关闭 |
 | `trigger.comment_cron` | 空 | 自动评论 cron 表达式；空表示关闭 |

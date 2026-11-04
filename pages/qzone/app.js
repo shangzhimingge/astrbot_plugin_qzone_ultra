@@ -16,11 +16,13 @@ const state = {
   media: [],
   loading: false,
   pendingLikes: new Set(),
+  pendingComments: new Set(),
   pendingDeletes: new Set(),
   pendingDeleteConfirms: new Map(),
   knownAuthors: new Map(),
   replyTarget: null,
   replyDrafts: new Map(),
+  commentDrafts: new Map(),
   pendingReplies: new Set(),
   localVersions: new Map(),
   detailCache: new Map(),
@@ -1291,14 +1293,56 @@ function renderDetail(post, options = {}) {
   const input = document.createElement("textarea");
   input.rows = 3;
   input.placeholder = "写下你的评论...";
+  input.value = state.commentDrafts.get(post.id) || "";
+  input.addEventListener("input", () => {
+    state.commentDrafts.set(post.id, input.value);
+  });
   const submit = document.createElement("button");
   submit.type = "submit";
   submit.textContent = "发送";
-  form.append(input, submit);
+  submit.disabled = state.pendingComments.has(post.id);
+  const aiButton = document.createElement("button");
+  aiButton.type = "button";
+  aiButton.className = "ghost ai-comment-draft";
+  aiButton.textContent = "AI 生成评论";
+  aiButton.setAttribute("aria-label", "AI 生成评论");
+  const aiStatus = document.createElement("span");
+  aiStatus.className = "muted ai-draft-status";
+  aiStatus.setAttribute("role", "status");
+  aiButton.addEventListener("click", async () => {
+    if (aiButton.disabled) return;
+    const targetId = post.id;
+    const originalValue = input.value;
+    aiButton.disabled = true;
+    aiButton.textContent = "正在生成…";
+    aiStatus.textContent = "正在生成评论草稿";
+    try {
+      const data = await apiPost("page/ai-comment", { id: targetId });
+      if (!input.isConnected || selectedPostId() !== targetId || input.value !== originalValue) return;
+      input.value = text(data.content || "");
+      state.commentDrafts.set(targetId, input.value);
+      aiStatus.textContent = "草稿已填入，可编辑后手动发送";
+    } catch (error) {
+      if (input.isConnected && selectedPostId() === targetId) aiStatus.textContent = error.message || "生成评论草稿失败";
+    } finally {
+      aiButton.disabled = false;
+      aiButton.textContent = "AI 生成评论";
+    }
+  });
+  form.append(input, aiButton, submit, aiStatus);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    await sendComment(post, input.value);
-    input.value = "";
+    const postId = post.id;
+    if (state.pendingComments.has(postId) || !input.value.trim()) return;
+    state.commentDrafts.set(postId, input.value);
+    state.pendingComments.add(postId);
+    renderSelectedIfNeeded(postId);
+    try {
+      if (await sendComment(post, input.value)) state.commentDrafts.delete(postId);
+    } finally {
+      state.pendingComments.delete(postId);
+      renderSelectedIfNeeded(postId);
+    }
   });
 
   el.detailContent.append(comments, form);
@@ -1373,7 +1417,39 @@ function renderComment(post, comment) {
     submit.type = "submit";
     submit.className = "primary";
     submit.textContent = "发送回复";
-    actions.append(cancel, submit);
+    const aiButton = document.createElement("button");
+    aiButton.type = "button";
+    aiButton.className = "ghost ai-reply-draft";
+    aiButton.textContent = "AI 生成回复";
+    aiButton.setAttribute("aria-label", "AI 生成回复");
+    const aiStatus = document.createElement("span");
+    aiStatus.className = "muted ai-draft-status";
+    aiStatus.setAttribute("role", "status");
+    aiButton.addEventListener("click", async () => {
+      if (aiButton.disabled) return;
+      const postId = post.id;
+      const commentId = text(comment.id);
+      const commentUin = Number(comment.author?.uin || comment.uin || 0);
+      const originalValue = input.value;
+      aiButton.disabled = true;
+      aiButton.textContent = "正在生成…";
+      aiStatus.textContent = "正在生成回复草稿";
+      try {
+        const data = await apiPost("page/ai-reply", { id: postId, commentid: commentId, comment_uin: commentUin });
+        if (!input.isConnected || state.replyTarget?.postId !== postId || state.replyTarget?.commentId !== commentId || input.value !== originalValue) return;
+        input.value = text(data.content || "");
+        state.replyDrafts.set(targetKey, input.value);
+        aiStatus.textContent = "草稿已填入，可编辑后手动发送";
+      } catch (error) {
+        if (input.isConnected && state.replyTarget?.postId === postId && state.replyTarget?.commentId === commentId) {
+          aiStatus.textContent = error.message || "生成回复草稿失败";
+        }
+      } finally {
+        aiButton.disabled = false;
+        aiButton.textContent = "AI 生成回复";
+      }
+    });
+    actions.append(cancel, aiButton, submit, aiStatus);
     form.append(input, actions);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -1619,6 +1695,7 @@ async function sendComment(post, content) {
     updatePost(postId, { comments: nextComments });
     markLocalChange(postId);
     setNotice("评论已发送。", "success");
+    return true;
   } catch (error) {
     const target = currentPostById(postId, post);
     const currentComments = [...(target?.comments || [])];
@@ -1632,6 +1709,7 @@ async function sendComment(post, content) {
     });
     markLocalChange(postId);
     setNotice(error.message || "评论失败", "error");
+    return false;
   } finally {
     renderFeed();
     renderSelectedIfNeeded(postId);
