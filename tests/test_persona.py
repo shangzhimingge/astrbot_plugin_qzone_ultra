@@ -151,6 +151,67 @@ def test_scheduled_event_uses_shared_resolved_umo():
     assert event.unified_msg_origin is None
 
 
+def test_none_event_provider_and_persona_share_exact_context_umo():
+    async def scenario():
+        exact = "custom-instance-7:GroupMessage:123"
+
+        class StrictManager:
+            def __init__(self):
+                self.umo_values = []
+
+            async def resolve_selected_persona(self, **kwargs):
+                self.umo_values.append(kwargs["umo"])
+                if kwargs["umo"] == exact and kwargs["conversation_persona_id"] == "stored-persona":
+                    return "forced-persona", {"prompt": "exact-context-persona"}, "forced-persona", False
+                return "default", {"prompt": "wrong-context-default"}, None, False
+
+            async def get_default_persona_v3(self, umo=None):
+                return {"prompt": "fallback"}
+
+        class StrictConversations:
+            async def get_curr_conversation_id(self, umo):
+                return "conversation" if umo == exact else None
+
+            async def get_conversation(self, umo, cid):
+                assert umo == exact
+                return {"persona_id": "stored-persona"}
+
+        class StrictContext(Context):
+            def __init__(self):
+                super().__init__()
+                self.persona_manager = StrictManager()
+                self.conversation_manager = StrictConversations()
+                self.provider_umos = []
+
+            async def get_config(self, umo):
+                assert umo == exact
+                return {"provider_settings": {"source": "exact"}}
+
+            async def get_using_provider(self, *, umo):
+                self.provider_umos.append(umo)
+                return type("Provider", (), {"text_chat": lambda _self, **kwargs: None})()
+
+            async def get_current_chat_provider_id(self, *, umo):
+                self.provider_umos.append(umo)
+                return "provider-exact" if umo == exact else "provider-wrong"
+
+        context = StrictContext()
+        llm = QzoneLLM(context, PluginSettings(context_umo=exact))
+        assert await resolve_persona_prompt(context, llm.settings, None) == "exact-context-persona"
+        assert await llm._provider_by_id(None) is not None
+        assert await llm.current_provider_id(None) == "provider-exact"
+        assert context.provider_umos == [exact, exact]
+        assert context.persona_manager.umo_values == [exact]
+
+        inferred = QzoneLLM(context, PluginSettings(manage_group=123))
+        assert await resolve_persona_prompt(context, inferred.settings, None) == "exact-context-persona"
+        assert await inferred._provider_by_id(None) is not None
+        assert await inferred.current_provider_id(None) == "provider-exact"
+        assert context.provider_umos[-2:] == [exact, exact]
+        assert context.persona_manager.umo_values[-1] == exact
+    asyncio.run(scenario())
+
+
 def test_text_chat_keeps_persona_and_task_prompt():
     async def scenario():
         class Provider:

@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from .news import NewsItem
-from .persona import resolve_persona_prompt
+from .persona import resolve_context_umo, resolve_persona_prompt
 from .social import QzoneComment, QzonePost
 from .utils import truncate
 
@@ -118,7 +118,7 @@ class QzoneLLM:
         if not callable(getter):
             return None
 
-        umo = getattr(event, "unified_msg_origin", None)
+        umo = resolve_context_umo(context, self.settings, event)
         attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         if umo is not None:
             attempts.append(((), {"umo": umo}))
@@ -139,7 +139,7 @@ class QzoneLLM:
         getter = getattr(self.context, "get_current_chat_provider_id", None)
         if not callable(getter):
             return None
-        umo = getattr(event, "unified_msg_origin", None)
+        umo = resolve_context_umo(self.context, self.settings, event)
         attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         if umo is not None:
             attempts.append(((), {"umo": umo}))
