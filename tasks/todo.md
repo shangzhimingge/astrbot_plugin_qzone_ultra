@@ -8,6 +8,7 @@
 - [x] README/CHANGELOG and external implementation report/logs.
 - [x] Final full Python/Node checks, compile, diff check, inspect diff and incremental commits.
 - [x] Provide API/button selector contract and fixture QA instructions to root.
-- [ ] Sol final review remains pending; root browser QA passed. Do not push/PR before Sol verification and parent release decision.
+- [x] Sol final review verified at `9aa4f30b48901899622be356f31bf16d06528bd9`; parent approved normal publication. Root browser QA passed 11 flows. No push result is asserted here.
 
 - [x] Sol V4 UMO correction: explicit context_umo, unique-instance inference, shared scheduler/persona helper, exact MessageSession tests and full suite (496 passed).
+- [x] V4 provider-origin follow-up: explicit and inferred context UMO use the same exact mapping for config, conversation/forced Persona, provider selection, and current-provider lookup; final suite 497 passed.
