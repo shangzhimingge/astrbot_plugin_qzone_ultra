@@ -21,6 +21,11 @@
     "description": "大模型配置",
     "type": "object",
     "items": {
+      "persona_id": {
+        "description": "上下文无关的定时/Pages AI 草稿可选人格 ID；留空沿用 AstrBot 当前人格",
+        "type": "string",
+        "default": ""
+      },
       "post_provider_id": {
         "description": "写说说用的大模型提供商",
         "type": "string",
@@ -506,5 +511,21 @@
     "type": "float",
     "default": 0.35,
     "hint": "发布结果图远程头像或图片预览的单资源超时。"
+  },
+  "auto_reply": {
+    "description": "自动回复自己说说下的新评论",
+    "type": "object",
+    "items": {
+      "enabled": {"description": "启用自动回复", "type": "bool", "default": false},
+      "poll_interval": {"description": "轮询间隔（秒）", "type": "int", "default": 120, "hint": "最小 30 秒。"},
+      "delay_min": {"description": "发送前最短等待（秒）", "type": "int", "default": 30},
+      "delay_max": {"description": "发送前最长等待（秒）", "type": "int", "default": 180},
+      "recent_posts": {"description": "每轮检查的最近说说数", "type": "int", "default": 5},
+      "max_per_run": {"description": "每轮最多回复数", "type": "int", "default": 2},
+      "daily_limit": {"description": "每日回复预留额度", "type": "int", "default": 20},
+      "skip_low_information": {"description": "跳过低信息评论", "type": "bool", "default": true},
+      "reply_probability": {"description": "自动回复概率", "type": "float", "default": 0.8, "slider": {"min": 0.0, "max": 1.0}},
+      "ignore_users": {"description": "自动回评忽略的 QQ 号或昵称列表", "type": "list", "default": []}
+    }
   }
 }

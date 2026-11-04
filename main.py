@@ -4219,6 +4219,7 @@ class QzoneStablePlugin(Star):
             provider_id=self.settings.post_provider_id,
             system_prompt=system_prompt,
             prefer_current_provider=True,
+            inherit_persona=False,
         )
         cleaned = self._clean_life_publish_text(text)
         if cleaned:
@@ -4268,6 +4269,7 @@ class QzoneStablePlugin(Star):
 
         class _ScheduledEvent:
             def __init__(self, sender: int, group: int, text: str, obj: Any):
+                self._qzone_context_free = True
                 self.message_obj = obj
                 self.message_str = text
                 self.sender_id = sender

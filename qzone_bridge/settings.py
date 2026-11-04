@@ -141,6 +141,17 @@ class PluginSettings:
     manage_group: int = 0
     pillowmd_style_dir: str = ""
     post_provider_id: str = ""
+    persona_id: str = ""
+    auto_reply_enabled: bool = False
+    auto_reply_poll_interval: int = 120
+    auto_reply_delay_min: int = 30
+    auto_reply_delay_max: int = 180
+    auto_reply_recent_posts: int = 5
+    auto_reply_max_per_run: int = 2
+    auto_reply_daily_limit: int = 20
+    auto_reply_skip_low_information: bool = True
+    auto_reply_probability: float = 0.8
+    auto_reply_ignore_users: list[str] = field(default_factory=list)
     post_prompt: str = "找出一个你感兴趣的主题来写一段适合 QQ 空间的说说，简短、有个性、不要解释。"
     comment_provider_id: str = ""
     comment_prompt: str = "生成一句简短、直接、贴题的评论，不要解释。"
@@ -240,6 +251,17 @@ class PluginSettings:
             manage_group=_as_int(_pick(mapping, "manage_group", 0), 0, minimum=0),
             pillowmd_style_dir=str(_pick(mapping, "pillowmd_style_dir", "") or ""),
             post_provider_id=str(_nested(mapping, "llm", "post_provider_id", "") or ""),
+            persona_id=str(_nested(mapping, "llm", "persona_id", "") or "").strip(),
+            auto_reply_enabled=_as_bool(_nested(mapping, "auto_reply", "enabled", False), False),
+            auto_reply_poll_interval=_as_int(_nested(mapping, "auto_reply", "poll_interval", 120), 120, minimum=30, maximum=3600),
+            auto_reply_delay_min=_as_int(_nested(mapping, "auto_reply", "delay_min", 30), 30, minimum=0, maximum=3600),
+            auto_reply_delay_max=_as_int(_nested(mapping, "auto_reply", "delay_max", 180), 180, minimum=0, maximum=3600),
+            auto_reply_recent_posts=_as_int(_nested(mapping, "auto_reply", "recent_posts", 5), 5, minimum=1, maximum=20),
+            auto_reply_max_per_run=_as_int(_nested(mapping, "auto_reply", "max_per_run", 2), 2, minimum=1, maximum=20),
+            auto_reply_daily_limit=_as_int(_nested(mapping, "auto_reply", "daily_limit", 20), 20, minimum=1, maximum=500),
+            auto_reply_skip_low_information=_as_bool(_nested(mapping, "auto_reply", "skip_low_information", True), True),
+            auto_reply_probability=_as_float(_nested(mapping, "auto_reply", "reply_probability", 0.8), 0.8, minimum=0.0, maximum=1.0),
+            auto_reply_ignore_users=[str(item).strip() for item in _as_list(_nested(mapping, "auto_reply", "ignore_users", [])) if str(item).strip()],
             post_prompt=str(_nested(mapping, "llm", "post_prompt", cls.post_prompt) or cls.post_prompt),
             comment_provider_id=str(_nested(mapping, "llm", "comment_provider_id", "") or ""),
             comment_prompt=str(_nested(mapping, "llm", "comment_prompt", cls.comment_prompt) or cls.comment_prompt),

@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from .news import NewsItem
+from .persona import resolve_persona_prompt
 from .social import QzoneComment, QzonePost
 from .utils import truncate
 
@@ -163,14 +164,22 @@ class QzoneLLM:
         provider_id: str = "",
         system_prompt: str = "",
         prefer_current_provider: bool = False,
+        inherit_persona: bool = True,
     ) -> str:
+        if inherit_persona:
+            persona_prompt = await resolve_persona_prompt(self.context, self.settings, event)
+            system_prompt = "\n\n".join(part.strip() for part in (persona_prompt, system_prompt) if part and part.strip())
         provider = await self._provider_by_id(event, provider_id)
         text_chat = getattr(provider, "text_chat", None)
         if callable(text_chat):
-            attempts: list[dict[str, Any]] = [{"prompt": prompt}]
+            attempts: list[dict[str, Any]] = []
             if system_prompt:
-                attempts.insert(0, {"prompt": prompt, "contexts": [], "system_prompt": system_prompt})
-                attempts.insert(1, {"prompt": prompt, "context": [], "system_prompt": system_prompt})
+                attempts.extend((
+                    {"prompt": prompt, "contexts": [], "system_prompt": system_prompt},
+                    {"prompt": prompt, "context": [], "system_prompt": system_prompt},
+                ))
+            else:
+                attempts.append({"prompt": prompt})
             for kwargs in attempts:
                 try:
                     response = await self._maybe_await(text_chat(**kwargs))
@@ -192,9 +201,13 @@ class QzoneLLM:
             try:
                 response = await self._maybe_await(generator(**kwargs))
             except TypeError:
+                if "chat_provider_id" not in kwargs:
+                    raise
                 kwargs.pop("chat_provider_id", None)
                 response = await self._maybe_await(generator(**kwargs))
             return self.text_from_response(response)
+        if callable(text_chat) and system_prompt:
+            raise RuntimeError("当前 Provider 与 AstrBot Context 均未提供保留人格提示词的调用方式")
         return ""
 
     @staticmethod
@@ -342,15 +355,15 @@ class QzoneLLM:
         return truncate(cleaned, max_len)
 
     def _comment_context(self, post: QzonePost) -> str:
-        lines = [f"说说内容：{post.summary or '(空)'}"]
+        lines = [f"说说内容：{truncate(post.summary or '(空)', 1200)}"]
         if post.images:
-            lines.append("图片：" + "，".join(post.images[:6]))
+            lines.append("图片：" + "，".join(truncate(item, 300) for item in post.images[:6]))
         visible_comments = [comment for comment in post.comments if comment.content][:8]
         if visible_comments:
             lines.append("已有评论：")
             for comment in visible_comments:
                 name = comment.nickname or str(comment.uin or "用户")
-                lines.append(f"- {name}: {comment.content}")
+                lines.append(f"- {truncate(name, 80)}: {truncate(comment.content, 400)}")
         return "\n".join(lines)
 
     def _clean_short_reply(self, text: str) -> str:
@@ -385,7 +398,7 @@ class QzoneLLM:
         prompt = (
             f"{self.settings.reply_prompt}\n\n{COMMENT_OUTPUT_RULES}\n\n"
             f"{self._comment_context(post)}\n"
-            f"要回复的评论：{comment.nickname or comment.uin}: {comment.content}"
+            f"要回复的评论：{truncate(comment.nickname or str(comment.uin), 80)}: {truncate(comment.content, 1000)}"
         )
         text = await self.generate_text(
             event,
