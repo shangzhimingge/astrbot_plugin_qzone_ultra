@@ -323,9 +323,9 @@ def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeyp
 
     main = _import_main_with_stubs(monkeypatch)
     metadata = Path("metadata.yaml").read_text(encoding="utf-8")
-    assert qzone_bridge.__version__ == "0.9.4"
-    assert "version: 0.9.4" in metadata
-    assert qzone_bridge.BRIDGE_API_VERSION == 2026110501
+    assert qzone_bridge.__version__ == "0.9.5"
+    assert "version: 0.9.5" in metadata
+    assert qzone_bridge.BRIDGE_API_VERSION == 2026110502
     assert main.REQUIRED_QZONE_BRIDGE_API_VERSION == qzone_bridge.BRIDGE_API_VERSION
 
 
@@ -1780,6 +1780,273 @@ def test_daemon_secret_is_not_passed_in_argv(tmp_path, monkeypatch: pytest.Monke
     assert "--secret" not in cmd
     assert isinstance(env, dict)
     assert env.get("QZONE_BRIDGE_SECRET")
+
+
+def test_guarded_life_publish_holds_live_account_target_until_send_finishes(tmp_path: Path) -> None:
+    from qzone_bridge.daemon import QzoneDaemonService
+    from qzone_bridge.errors import QzoneNeedsRebind
+
+    store = StateStore(tmp_path)
+    store.write(BridgeState(session=SessionState(uin=123, cookies={"uin": "o123", "p_skey": "a"}, needs_rebind=False)))
+    service = QzoneDaemonService(store, secret="secret", port=8765, keepalive_interval=30, request_timeout=0.01)
+    service.warmup = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def fake_publish(**kwargs):
+            calls.append(kwargs)
+            entered.set()
+            await release.wait()
+            return {"fid": "f1"}
+
+        service._publish_post_impl = fake_publish  # type: ignore[method-assign]
+        publishing = asyncio.create_task(service.publish_post(content="x", expected_login_uin=123))
+        await entered.wait()
+        binding = asyncio.create_task(service.bind_cookie("uin=o456; p_uin=o456; p_skey=b", source="manual"))
+        await asyncio.sleep(0)
+        assert service.state.session.uin == 123 and not binding.done()
+        release.set()
+        assert await publishing == {"fid": "f1"}
+        await binding
+        assert service.state.session.uin == 456 and len(calls) == 1
+        service.state.session.uin = 123
+        service.state.session.needs_rebind = False
+        service.client.update_session(SessionState(uin=456, cookies={"uin": "o456", "p_skey": "b"}, needs_rebind=False))
+        with pytest.raises(QzoneNeedsRebind):
+            await service.publish_post(content="x", expected_login_uin=123)
+        assert len(calls) == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(service.client.close())
+
+
+def test_guarded_publish_has_no_replay_and_ordinary_publish_contract_remains(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from qzone_bridge.daemon import QzoneDaemonService
+
+    store = StateStore(tmp_path)
+    store.write(BridgeState(session=SessionState(uin=123, cookies={"uin": "o123", "p_skey": "a"}, needs_rebind=False)))
+    service = QzoneDaemonService(store, secret="secret", port=8765, keepalive_interval=30, request_timeout=0.01)
+
+    async def scenario():
+        calls = []
+
+        async def fake_publish(**kwargs):
+            calls.append(kwargs)
+            return {"fid": "f1"}
+
+        service._publish_post_impl = fake_publish  # type: ignore[method-assign]
+        assert await service.publish_post(content="ordinary") == {"fid": "f1"}
+        assert await service.publish_post(content="life", expected_login_uin=123) == {"fid": "f1"}
+        assert len(calls) == 2
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(service.client.close())
+
+
+def test_guarded_controller_publish_does_not_retry_transport_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+    state = controller.store.read()
+    state.runtime.secret = "secret"
+    state.runtime.daemon_port = 8765
+    controller.store.write(state)
+    calls = []
+
+    async def healthy(_port):
+        return True
+
+    async def fail_request(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise httpx.ConnectError("connection dropped after request dispatch")
+
+    monkeypatch.setattr(controller, "_probe_health", healthy)
+    monkeypatch.setattr(controller._client, "request", fail_request)
+
+    async def scenario():
+        with pytest.raises(DaemonUnavailableError):
+            await controller.publish_post(content="life", expected_login_uin=123)
+        assert len(calls) == 1
+        calls.clear()
+        controller.auto_start_daemon = True
+
+        async def ensure_running():
+            return 8765
+
+        monkeypatch.setattr(controller, "ensure_running", ensure_running)
+        with pytest.raises(DaemonUnavailableError):
+            await controller._request("POST", "/post", json_body={}, retry_on_transport_error=True)
+        assert len(calls) == 2
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller._client.aclose())
+
+
+@pytest.mark.parametrize("operation", ["bind", "unbind"])
+def test_local_bind_fallback_requires_positive_owned_exit_and_stable_offline_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str,
+) -> None:
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+    state = controller.store.read()
+    state.runtime.secret = "secret"
+    state.runtime.daemon_port = 8765
+    state.runtime.daemon_pid = 321
+    if operation == "unbind":
+        state.session = SessionState(uin=123, cookies={"uin": "o123", "p_skey": "old"}, needs_rebind=False)
+    controller.store.write(state)
+
+    class ExitedProcess:
+        pid = 321
+
+        def poll(self):
+            return 0
+
+    controller._process = ExitedProcess()  # type: ignore[assignment]
+
+    async def health(_port, **_kwargs):
+        return False
+
+    async def free(_port):
+        return True
+
+    async def predispatch_error(*_args, **_kwargs):
+        raise DaemonUnavailableError("preflight", detail={"request_dispatched": False})
+
+    monkeypatch.setattr(controller, "bind_cookie" if operation == "bind" else "unbind", predispatch_error)
+    monkeypatch.setattr(controller, "_probe_health", health)
+    monkeypatch.setattr("qzone_bridge.controller._port_is_free_async", free)
+
+    async def scenario():
+        if operation == "bind":
+            result = await controller.bind_cookie_local("uin=o456; p_uin=o456; p_skey=test", source="manual")
+            assert result["login_uin"] == 456
+            assert controller.store.read().session.uin == 456
+        else:
+            result = await controller.unbind_local()
+            assert result["login_uin"] == 0 and result["needs_rebind"]
+            assert controller.store.read().session.uin == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller._client.aclose())
+
+
+@pytest.mark.parametrize("dispatched,live,port_free,persisted_pid", [
+    (True, False, True, 321),
+    (False, True, True, 321),
+    (False, False, False, 321),
+    (False, False, True, 999),
+])
+def test_local_bind_fallback_rejects_unknown_or_unproven_daemon_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dispatched: bool, live: bool, port_free: bool, persisted_pid: int,
+) -> None:
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+    state = controller.store.read()
+    state.runtime.secret = "secret"
+    state.runtime.daemon_port = 8765
+    state.runtime.daemon_pid = persisted_pid
+    controller.store.write(state)
+
+    class FakeProcess:
+        pid = 321
+
+        def poll(self):
+            return None if live else 0
+
+    controller._process = FakeProcess()  # type: ignore[assignment]
+
+    async def health(_port, **_kwargs):
+        return live
+
+    async def free(_port):
+        return port_free
+
+    async def failed_rpc(*_args, **_kwargs):
+        raise DaemonUnavailableError("rpc result", detail={"request_dispatched": dispatched})
+
+    monkeypatch.setattr(controller, "bind_cookie", failed_rpc)
+    monkeypatch.setattr(controller, "_probe_health", health)
+    monkeypatch.setattr("qzone_bridge.controller._port_is_free_async", free)
+
+    async def scenario():
+        with pytest.raises(DaemonUnavailableError):
+            await controller.bind_cookie_local("uin=o456; p_uin=o456; p_skey=test", source="manual")
+        assert controller.store.read().session.uin == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller._client.aclose())
+
+
+def test_local_bind_fallback_rejects_missing_exit_receipt_when_persisted_pid_is_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+    state = controller.store.read()
+    state.runtime.secret = "secret"
+    state.runtime.daemon_port = 8765
+    state.runtime.daemon_pid = 0
+    controller.store.write(state)
+
+    async def predispatch_error(*_args, **_kwargs):
+        raise DaemonUnavailableError("preflight", detail={"request_dispatched": False})
+
+    async def health(_port, **_kwargs):
+        return False
+
+    async def free(_port):
+        return True
+
+    monkeypatch.setattr(controller, "bind_cookie", predispatch_error)
+    monkeypatch.setattr(controller, "_probe_health", health)
+    monkeypatch.setattr("qzone_bridge.controller._port_is_free_async", free)
+
+    async def scenario():
+        with pytest.raises(DaemonUnavailableError):
+            await controller.bind_cookie_local("uin=o456; p_uin=o456; p_skey=test")
+        assert controller.store.read().session.uin == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller._client.aclose())
+
+
+def test_dispatched_bind_timeout_never_uses_local_fallback_and_is_not_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+    state = controller.store.read()
+    state.runtime.secret = "secret"
+    state.runtime.daemon_port = 8765
+    controller.store.write(state)
+    calls = []
+
+    async def health(_port):
+        return True
+
+    async def timeout(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise httpx.ReadTimeout("response lost after dispatch")
+
+    monkeypatch.setattr(controller, "_probe_health", health)
+    monkeypatch.setattr(controller._client, "request", timeout)
+
+    async def scenario():
+        with pytest.raises(DaemonUnavailableError, match="绑定结果未确认"):
+            await controller.bind_cookie_local("uin=o456; p_uin=o456; p_skey=test")
+        assert len(calls) == 1
+        assert controller.store.read().session.uin == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        asyncio.run(controller._client.aclose())
 
 
 def test_daemon_spawn_passes_current_version(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
