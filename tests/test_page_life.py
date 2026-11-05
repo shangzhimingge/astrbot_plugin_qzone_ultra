@@ -84,6 +84,33 @@ def test_publish_gate_is_single_consumer_and_returns_only_cached_same_digest():
     asyncio.run(scenario())
 
 
+def test_public_diagnostic_allowlist_rejects_malformed_and_hostile_records():
+    async def scenario():
+        store = PageLifeJobStore()
+        job, _ = await store.admit("r", 123)
+        await store.fail(job.id)
+        job.publish_diagnostic = {
+            "id": "0123456789ab", "code": "INTERNAL_ERROR", "phase": "controller_call",
+            "message": "内部处理发生错误", "at": 1.0, "secret": "TOKEN_SENTINEL",
+        }
+        assert store.public_payload(job)["publish_diagnostic"] is None
+        class BadDict(dict):
+            def get(self, *_args):
+                raise AssertionError("untrusted mapping getter invoked")
+        job.publish_diagnostic = BadDict({
+            "id": "0123456789ab", "code": "INTERNAL_ERROR", "phase": "controller_call",
+            "message": "内部处理发生错误", "at": 1.0,
+        })
+        assert store.public_payload(job)["publish_diagnostic"] is None
+        job.publish_diagnostic = {
+            "id": "0123456789ab", "code": "INTERNAL_ERROR", "phase": "controller_call",
+            "message": "内部处理发生错误", "at": 10 ** 10000,
+        }
+        assert store.public_payload(job)["publish_diagnostic"] is None
+        await store.close()
+    asyncio.run(scenario())
+
+
 def test_close_cancels_owned_generation_and_prevents_late_completion():
     async def scenario():
         store = PageLifeJobStore()

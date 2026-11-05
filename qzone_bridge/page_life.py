@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,48 @@ PAGE_LIFE_MAX_REQUEST_IDS_PER_JOB = 16
 PAGE_LIFE_PHASES = {"preparing", "context", "image", "caption", "saving"}
 PAGE_LIFE_STATES = {"running", "succeeded", "failed", "cancelled"}
 PAGE_LIFE_PUBLISH_STATES = {"ready", "sending", "published", "unknown"}
+
+DIAGNOSTIC_MESSAGES = {
+    "INTERFACE_ERROR": "调用接口时发生错误",
+    "REQUEST_ERROR": "请求处理失败",
+    "SOURCE_OR_FORMAT_ERROR": "媒体来源或格式未通过处理",
+    "AUTH_REQUIRED": "登录状态需要重新确认",
+    "DAEMON_UNAVAILABLE": "后台服务暂不可用",
+    "TIMEOUT": "操作等待超时",
+    "CANCELLED": "操作被取消，结果按未确认保留",
+    "INTERNAL_ERROR": "内部处理发生错误",
+    "SOURCE_TOO_LARGE": "图片来源超过大小限制",
+    "ENCODED_SOURCE_TOO_LARGE": "图片编码内容超过大小限制",
+    "SOURCE_MISSING": "图片来源缺失",
+    "SOURCE_UNTRUSTED": "图片来源未通过本地校验",
+    "PIXEL_LIMIT": "图片尺寸超过处理限制",
+    "RASTER_UNSUPPORTED": "图片格式不受支持",
+    "RASTER_DECODE_FAILED": "图片解码失败",
+    "OUTPUT_TOO_LARGE": "预览图片超过输出限制",
+    "REMOTE_POLICY_FAILED": "图片来源校验未通过",
+    "PREVIEW_TIMEOUT": "预览读取或处理超时",
+}
+DIAGNOSTIC_PHASES = {
+    "controller_call", "result_processing", "bookkeeping",
+    "preview_read", "preview_raster", "preview_wait",
+}
+
+
+def public_diagnostic(record: Any) -> dict[str, Any] | None:
+    """Return only the fixed public diagnostic shape; discard malformed records."""
+    try:
+        if type(record) is not dict or any(type(key) is not str for key in record) or set(record) != {"id", "code", "phase", "message", "at"}:
+            return None
+        ident, code, phase, message, at = (record.get(k) for k in ("id", "code", "phase", "message", "at"))
+        valid_time = type(at) in {int, float} and 0 <= at <= 1_000_000_000_000 and math.isfinite(float(at))
+        if (type(ident) is not str or len(ident) != 12 or any(c not in "0123456789abcdef" for c in ident)
+                or type(code) is not str or code not in DIAGNOSTIC_MESSAGES
+                or type(phase) is not str or phase not in DIAGNOSTIC_PHASES
+                or type(message) is not str or message != DIAGNOSTIC_MESSAGES[code] or not valid_time):
+            return None
+        return {"id": ident, "code": code, "phase": phase, "message": message, "at": at}
+    except Exception:
+        return None
 
 
 class PageLifeError(ValueError):
@@ -46,6 +89,9 @@ class PageLifeJob:
     publish_result: dict[str, Any] | None = None
     draft_save_started: bool = False
     thumbnail_cache: dict[str, bytes] = field(default_factory=dict, repr=False)
+    publish_diagnostic: dict[str, Any] | None = None
+    preview_diagnostic: dict[str, Any] | None = None
+    preview_diagnostic_key: str = field(default="", repr=False)
 
 
 class PageLifeJobStore:
@@ -308,7 +354,9 @@ class PageLifeJobStore:
             if job.publish_state == "sending":
                 raise PageLifeError("LIFE_SENDING", "日常草稿正在发布，请稍后查询状态。")
             if job.publish_state == "unknown":
-                raise PageLifeError("LIFE_UNKNOWN", "发布结果尚不确定，请先查询空间状态，不要重复提交。")
+                diagnostic = public_diagnostic(job.publish_diagnostic)
+                suffix = f"{diagnostic['code']} {diagnostic['id']}" if diagnostic else ""
+                raise PageLifeError("LIFE_UNKNOWN", f"发布结果尚不确定，请先查询空间状态，不要重复提交。{suffix}")
             if job.publish_state != "ready":
                 raise PageLifeError("LIFE_NOT_READY", "日常草稿当前不可发布。")
             job.publish_state = "sending"
@@ -328,15 +376,43 @@ class PageLifeJobStore:
             self._prune_locked(job.updated_at)
             return True
 
-    async def mark_unknown(self, job_id: str) -> None:
+    async def mark_unknown(self, job_id: str, *, diagnostic: dict[str, Any] | None = None) -> None:
         async with self._lock:
             job = self._jobs.get(job_id)
-            if job is not None and job.publish_state == "sending":
+            if job is None:
+                return
+            safe = public_diagnostic(diagnostic)
+            if job.publish_state == "sending":
                 job.publish_state = "unknown"
+                job.publish_diagnostic = safe
                 job.message = "发布结果尚不确定，请查询空间状态；系统不会自动重试。"
                 job.updated_at = self._clock()
                 job.completed_at = job.updated_at
                 self._prune_locked(job.updated_at)
+            elif job.publish_state == "published" and safe is not None and safe["phase"] == "bookkeeping" and job.publish_diagnostic is None:
+                # The send result is already recorded; retain the bookkeeping problem without downgrading it.
+                job.publish_diagnostic = safe
+                job.updated_at = self._clock()
+                job.completed_at = job.updated_at
+                self._prune_locked(job.updated_at)
+
+    async def mark_preview_diagnostic(self, job_id: str, key: str, diagnostic: dict[str, Any]) -> dict[str, Any] | None:
+        async with self._lock:
+            self._prune_locked(self._clock())
+            job = self._jobs.get(job_id)
+            if self._closed or job is None or job.state != "succeeded":
+                return None
+            safe = public_diagnostic(diagnostic)
+            if safe is None:
+                return None
+            previous = public_diagnostic(job.preview_diagnostic)
+            if (previous is not None and job.preview_diagnostic_key == key
+                    and previous["code"] == safe["code"] and previous["phase"] == safe["phase"]):
+                return dict(previous)
+            job.preview_diagnostic = safe
+            job.preview_diagnostic_key = key
+            job.updated_at = self._clock()
+            return dict(safe)
 
     @staticmethod
     def public_payload(job: PageLifeJob, *, include_result: bool = True) -> dict[str, Any]:
@@ -351,6 +427,8 @@ class PageLifeJobStore:
             "draft_id": job.draft_id or None,
             "has_media": job.has_media,
             "publish_state": job.publish_state,
+            "publish_diagnostic": public_diagnostic(job.publish_diagnostic),
+            "preview_diagnostic": public_diagnostic(job.preview_diagnostic),
         }
         if include_result and job.state == "succeeded":
             payload["content"] = job.content

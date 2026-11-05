@@ -7,12 +7,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 
+from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftStore
-from qzone_bridge.errors import QzoneParseError
+from qzone_bridge.errors import QzoneParseError, QzoneRequestError
 from qzone_bridge.media import PostPayload
 from qzone_bridge.page_api import QzonePageApi
 from qzone_bridge.page_life import PageLifeError
+from qzone_bridge.models import SessionState
 
 
 class Controller:
@@ -200,6 +203,94 @@ def test_preview_routes_trusted_http_through_existing_source_policy(monkeypatch,
     asyncio.run(scenario())
 
 
+def test_preview_failure_is_retained_separately_and_same_failure_keeps_id(monkeypatch, tmp_path):
+    async def scenario():
+        controller = Controller()
+        api = _api(tmp_path, controller, lambda _progress: None)
+        job, _ = await api._life_jobs.admit("r", 123)
+        await api._life_jobs.succeed(job.id, draft_id=1, content="x", media=[], media_sources={
+            "mid": {"kind": "image", "source": "https://media.example.test/a.jpg?TOKEN_SENTINEL", "name": "a.jpg", "mime_type": "image/jpeg"},
+        }, has_media=True, message="ok")
+        api._life_owned_media["mid"] = (job.id, "up")
+        original = {"id": "0123456789ab", "code": "REQUEST_ERROR", "phase": "controller_call",
+                    "message": "请求处理失败", "at": 1.0}
+        await api._life_jobs.begin_publish(job.id, 123, "digest")
+        await api._life_jobs.mark_unknown(job.id, diagnostic=original)
+        count = []
+        async def rejected(_media):
+            count.append(1)
+            raise QzoneParseError("https://media.example.test/a.jpg?TOKEN_SENTINEL")
+        monkeypatch.setattr("qzone_bridge.page_api.open_page_media_stream", rejected)
+        ids = []
+        for _ in range(2):
+            with pytest.raises(PageLifeError) as caught:
+                await api.life_draft_preview({"job_id": job.id, "media_id": "mid"})
+            ids.append(caught.value.message.split()[-1])
+            state = (await api.get_life_draft({"id": job.id}))["data"]
+            assert state["publish_diagnostic"] == original
+            assert state["preview_diagnostic"]["code"] == "REMOTE_POLICY_FAILED"
+            assert "TOKEN_SENTINEL" not in str(state) + caught.value.message
+        assert count == [1, 1] and ids[0] == ids[1]
+        assert len(api._life_preview_inflight) == 0 and controller.published == []
+        await api.close()
+    asyncio.run(scenario())
+
+
+def test_preview_failure_rechecks_owner_before_retaining_or_disclosing(monkeypatch, tmp_path):
+    async def scenario():
+        controller = Controller()
+        api = _api(tmp_path, controller, lambda _progress: None)
+        job, _ = await api._life_jobs.admit("r", 123)
+        await api._life_jobs.succeed(job.id, draft_id=1, content="x", media=[], media_sources={
+            "mid": {"kind": "image", "source": "https://media.example.test/a.jpg", "name": "a.jpg", "mime_type": "image/jpeg"},
+        }, has_media=True, message="ok")
+        api._life_owned_media["mid"] = (job.id, "up")
+        async def switch_then_fail(_media):
+            controller.status["login_uin"] = 456
+            raise QzoneParseError("untrusted private detail")
+        monkeypatch.setattr("qzone_bridge.page_api.open_page_media_stream", switch_then_fail)
+        with pytest.raises(PageLifeError) as caught:
+            await api.life_draft_preview({"job_id": job.id, "media_id": "mid"})
+        assert caught.value.code == "LIFE_ACCOUNT_CHANGED"
+        assert job.preview_diagnostic is None
+        await api.close()
+    asyncio.run(scenario())
+
+
+def test_preview_cancellation_closes_stream_and_retains_fixed_record(monkeypatch, tmp_path):
+    async def scenario():
+        controller = Controller()
+        api = _api(tmp_path, controller, lambda _progress: None)
+        job, _ = await api._life_jobs.admit("r", 123)
+        await api._life_jobs.succeed(job.id, draft_id=1, content="x", media=[], media_sources={
+            "mid": {"kind": "image", "source": "https://media.example.test/a.jpg", "name": "a.jpg", "mime_type": "image/jpeg"},
+        }, has_media=True, message="ok")
+        api._life_owned_media["mid"] = (job.id, "up")
+        started, closed = asyncio.Event(), asyncio.Event()
+        async def stream_body():
+            try:
+                started.set()
+                await asyncio.Future()
+                yield b""
+            finally:
+                closed.set()
+        class Stream:
+            def __aiter__(self): return stream_body()
+            async def aclose(self): closed.set()
+        async def open_stream(_media): return Stream(), 200, {}
+        monkeypatch.setattr("qzone_bridge.page_api.open_page_media_stream", open_stream)
+        task = asyncio.create_task(api.life_draft_preview({"job_id": job.id, "media_id": "mid"}))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed.is_set()
+        record = (await api.get_life_draft({"id": job.id}))["data"]["preview_diagnostic"]
+        assert record["code"] == "CANCELLED" and record["phase"] == "preview_wait"
+        await api.close()
+    asyncio.run(scenario())
+
+
 def test_preview_rechecks_current_account_after_thumbnail_processing(monkeypatch, tmp_path):
     async def scenario():
         controller = Controller()
@@ -264,11 +355,174 @@ def test_life_publish_postprocessing_failure_marks_unknown_and_never_retries(tmp
             await api.publish({"content": "daily", "life_job_id": job.id})
         assert len(controller.published) == 1
         assert job.publish_state == "unknown"
+        assert job.publish_diagnostic["code"] == "INTERNAL_ERROR"
+        assert job.publish_diagnostic["phase"] == "result_processing"
+        assert "private detail" not in str((await api.get_life_draft({"id": job.id}))["data"])
         with pytest.raises(PageLifeError, match="不确定"):
             await api.publish({"content": "daily", "life_job_id": job.id})
         assert len(controller.published) == 1
         await api.close()
 
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("failure", "expected_code"), [
+    (TypeError("TOKEN secret call args"), "INTERFACE_ERROR"),
+    (QzoneRequestError("https://HOST/path?TOKEN=secret", detail={"rkey": "secret"}), "REQUEST_ERROR"),
+])
+def test_life_publish_diagnostic_is_safe_retained_and_never_retries(tmp_path, failure, expected_code):
+    async def scenario():
+        controller = Controller()
+        calls = []
+        async def fail(**kwargs):
+            calls.append(kwargs)
+            raise failure
+        controller.publish_post = fail
+        async def generate(_progress):
+            return PostPayload("daily", [])
+        api = _api(tmp_path, controller, generate)
+        start = await api.start_life_draft({"action": "generate_draft", "request_id": "r"})
+        job = await api._life_jobs.get(start["data"]["id"], 123)
+        await job.task
+        with pytest.raises(PageLifeError) as caught:
+            await api.publish({"content": "daily", "life_job_id": job.id})
+        assert caught.value.code == "LIFE_UNKNOWN"
+        assert expected_code in caught.value.message
+        assert job.publish_state == "unknown" and len(calls) == 1
+        public = (await api.get_life_draft({"id": job.id}))["data"]["publish_diagnostic"]
+        assert set(public) == {"id", "code", "phase", "message", "at"}
+        assert public["code"] == expected_code and public["phase"] == "controller_call"
+        assert len(public["id"]) == 12
+        assert not any(secret in str(public) + caught.value.message for secret in ("TOKEN", "HOST", "secret", "rkey", "https://"))
+        with pytest.raises(PageLifeError) as repeated:
+            await api.publish({"content": "daily", "life_job_id": job.id})
+        again = (await api.get_life_draft({"id": job.id}))["data"]["publish_diagnostic"]
+        assert len(calls) == 1 and again == public and public["id"] in repeated.value.message
+        await api.close()
+    asyncio.run(scenario())
+
+
+def test_life_publish_classifier_avoids_hostile_exception_class_properties(tmp_path):
+    class HostileMeta(type):
+        def __hash__(cls):
+            raise RuntimeError("TOKEN_HASH_SENTINEL")
+        def __eq__(cls, _other):
+            raise RuntimeError("TOKEN_EQ_SENTINEL")
+    class HostileFailure(Exception, metaclass=HostileMeta):
+        @property
+        def __class__(self):
+            raise RuntimeError("SHOULD_NOT_BE_READ")
+    async def scenario():
+        controller = Controller()
+        calls = []
+        async def fail(**_kwargs):
+            calls.append(1)
+            raise HostileFailure("COOKIE_SENTINEL")
+        controller.publish_post = fail
+        api = _api(tmp_path, controller, lambda _progress: asyncio.sleep(0, result=PostPayload("daily", [])))
+        start = await api.start_life_draft({"action": "generate_draft", "request_id": "hostile"})
+        job = await api._life_jobs.get(start["data"]["id"], 123)
+        await job.task
+        with pytest.raises(PageLifeError) as caught:
+            await api.publish({"content": "daily", "life_job_id": job.id})
+        assert job.publish_state == "unknown" and job.publish_diagnostic["code"] == "INTERNAL_ERROR"
+        assert calls == [1] and not any(secret in caught.value.message for secret in (
+            "COOKIE_SENTINEL", "TOKEN_CODE_SENTINEL", "TOKEN_DETAIL_SENTINEL",
+            "TOKEN_HASH_SENTINEL", "TOKEN_EQ_SENTINEL", "SHOULD_NOT_BE_READ",
+        ))
+        await api.close()
+    asyncio.run(scenario())
+
+
+def test_bookkeeping_failure_after_mark_published_keeps_published_and_diagnostic(tmp_path, monkeypatch):
+    async def scenario():
+        controller = Controller()
+        async def generate(_progress):
+            return PostPayload("daily", [])
+        api = _api(tmp_path, controller, generate)
+        start = await api.start_life_draft({"action": "generate_draft", "request_id": "bookkeeping"})
+        job = await api._life_jobs.get(start["data"]["id"], 123)
+        await job.task
+        original = api._life_jobs.mark_published
+        async def mark_then_fail(job_id, result):
+            await original(job_id, result)
+            raise RuntimeError("private bookkeeping detail")
+        monkeypatch.setattr(api._life_jobs, "mark_published", mark_then_fail)
+        with pytest.raises(PageLifeError):
+            await api.publish({"content": "daily", "life_job_id": job.id})
+        assert len(controller.published) == 1 and job.publish_state == "published"
+        assert job.publish_diagnostic["phase"] == "bookkeeping"
+        assert "private bookkeeping detail" not in str((await api.get_life_draft({"id": job.id}))["data"])
+        result = await api.publish({"content": "daily", "life_job_id": job.id})
+        assert result["ok"] and len(controller.published) == 1
+        await api.close()
+    asyncio.run(scenario())
+
+
+def test_cancelled_life_publish_retains_unknown_and_never_retries(tmp_path):
+    async def scenario():
+        controller = Controller()
+        entered = asyncio.Event()
+        calls = []
+        async def wait_publish(**_kwargs):
+            calls.append(1)
+            entered.set()
+            await asyncio.Future()
+        controller.publish_post = wait_publish
+        async def generate(_progress): return PostPayload("daily", [])
+        api = _api(tmp_path, controller, generate)
+        start = await api.start_life_draft({"action": "generate_draft", "request_id": "cancel"})
+        job = await api._life_jobs.get(start["data"]["id"], 123)
+        await job.task
+        request = asyncio.create_task(api.publish({"content": "daily", "life_job_id": job.id}))
+        await entered.wait()
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert job.publish_state == "unknown" and job.publish_diagnostic["code"] == "CANCELLED"
+        with pytest.raises(PageLifeError):
+            await api.publish({"content": "daily", "life_job_id": job.id})
+        assert calls == [1]
+        await api.close()
+    asyncio.run(scenario())
+
+
+def test_life_publish_real_controller_transport_failure_retains_safe_diagnostic(tmp_path, monkeypatch):
+    async def scenario():
+        controller = QzoneDaemonController(plugin_root=tmp_path, data_dir=tmp_path / "data", auto_start_daemon=False)
+        state = controller.store.read()
+        state.runtime.secret = "COOKIE_SENTINEL"
+        state.runtime.daemon_port = 8765
+        state.session = SessionState(uin=123, cookies={"uin": "o123", "p_skey": "TOKEN_SENTINEL"})
+        controller.store.write(state)
+        controller._health_cache_data = (8765, "COOKIE_SENTINEL", {
+            "daemon_state": "ready", "login_uin": 123, "cookie_count": 2, "needs_rebind": False,
+        })
+        async def healthy(_port):
+            return True
+        monkeypatch.setattr(controller, "_probe_health", healthy)
+        calls = []
+        async def transport(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            raise httpx.ConnectError("URL_SENTINEL TOKEN_SENTINEL")
+        monkeypatch.setattr(controller._client, "request", transport)
+        async def generate(_progress):
+            return PostPayload("daily", [])
+        api = _api(tmp_path, controller, generate)
+        start = await api.start_life_draft({"action": "generate_draft", "request_id": "real-controller"})
+        job = await api._life_jobs.get(start["data"]["id"], 123)
+        await job.task
+        with pytest.raises(PageLifeError) as caught:
+            await api.publish({"content": "daily", "life_job_id": job.id})
+        assert len(calls) == 1 and calls[0][0] == "POST" and calls[0][1].endswith("/post")
+        assert calls[0][2]["json"]["expected_login_uin"] == 123
+        assert job.publish_state == "unknown"
+        record = (await api.get_life_draft({"id": job.id}))["data"]["publish_diagnostic"]
+        assert record["code"] == "DAEMON_UNAVAILABLE" and record["phase"] == "controller_call"
+        assert record["id"] in caught.value.message
+        assert "SENTINEL" not in str(record) + caught.value.message
+        await api.close()
+        await controller._client.aclose()
     asyncio.run(scenario())
 
 

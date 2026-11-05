@@ -347,6 +347,15 @@ button:active {
 .life-draft-status[data-tone="error"] { color: var(--danger); }
 
 .life-draft-result { margin-top: 10px; }
+.life-draft-diagnostics:not([hidden]) {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
 .life-draft-long-content {
   width: 100%;
   min-height: 150px;

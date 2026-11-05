@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>QQ空间Ultra</title>
-    <link rel="stylesheet" href="./style.css?v=2026110503-confirm" />
+    <link rel="stylesheet" href="./style.css?v=2026110504-diagnostics" />
   </head>
   <body>
     <div id="toastContainer" class="toast-container" aria-live="polite"></div>
@@ -55,6 +55,7 @@
             </div>
             <p id="lifeDraftStatus" class="life-draft-status" role="status" aria-live="polite">可按需生成一份可编辑的日常草稿。</p>
             <div id="lifeDraftResult" class="life-draft-result" hidden>
+              <div id="lifeDraftDiagnostics" class="life-draft-diagnostics" role="status" aria-live="polite" aria-label="日常草稿诊断信息"></div>
               <textarea id="lifeDraftLongContent" class="life-draft-long-content" readonly aria-label="超长日常草稿，可复制后自行编辑" hidden></textarea>
               <div id="lifeDraftPreview" class="life-draft-preview-list"></div>
               <button id="loadLifeDraft" class="ghost" type="button">载入编辑器</button>
@@ -111,6 +112,6 @@
     </dialog>
 
     <script src="/api/plugin/page/bridge-sdk.js"></script>
-    <script type="module" src="./app.js?v=2026110503-confirm"></script>
+    <script type="module" src="./app.js?v=2026110504-diagnostics"></script>
   </body>
 </html>

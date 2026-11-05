@@ -71,6 +71,7 @@ const el = {
   generateLifeDraft: document.getElementById("generateLifeDraft"),
   lifeDraftStatus: document.getElementById("lifeDraftStatus"),
   lifeDraftResult: document.getElementById("lifeDraftResult"),
+  lifeDraftDiagnostics: document.getElementById("lifeDraftDiagnostics"),
   lifeDraftPreview: document.getElementById("lifeDraftPreview"),
   lifeDraftLongContent: document.getElementById("lifeDraftLongContent"),
   loadLifeDraft: document.getElementById("loadLifeDraft"),
@@ -2031,6 +2032,41 @@ function scheduleLifePoll(jobId, delay = 1400) {
   }, delay);
 }
 
+const lifeDiagnosticMessages = {
+  INTERFACE_ERROR: "调用接口时发生错误", REQUEST_ERROR: "请求处理失败",
+  SOURCE_OR_FORMAT_ERROR: "媒体来源或格式未通过处理", AUTH_REQUIRED: "登录状态需要重新确认",
+  DAEMON_UNAVAILABLE: "后台服务暂不可用", TIMEOUT: "操作等待超时",
+  CANCELLED: "操作被取消，结果按未确认保留", INTERNAL_ERROR: "内部处理发生错误",
+  SOURCE_TOO_LARGE: "图片来源超过大小限制", ENCODED_SOURCE_TOO_LARGE: "图片编码内容超过大小限制",
+  SOURCE_MISSING: "图片来源缺失", SOURCE_UNTRUSTED: "图片来源未通过本地校验",
+  PIXEL_LIMIT: "图片尺寸超过处理限制", RASTER_UNSUPPORTED: "图片格式不受支持",
+  RASTER_DECODE_FAILED: "图片解码失败", OUTPUT_TOO_LARGE: "预览图片超过输出限制",
+  REMOTE_POLICY_FAILED: "图片来源校验未通过", PREVIEW_TIMEOUT: "预览读取或处理超时",
+};
+const lifeDiagnosticPhases = new Set(["controller_call", "result_processing", "bookkeeping", "preview_read", "preview_raster", "preview_wait"]);
+
+function acceptedLifeDiagnostic(value, allowedPhases) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!Object.hasOwn(lifeDiagnosticMessages, value.code) || !lifeDiagnosticPhases.has(value.phase)
+      || !allowedPhases.has(value.phase) || !/^[0-9a-f]{12}$/.test(value.id || "")) return null;
+  return { id: value.id, code: value.code, phase: value.phase };
+}
+
+function renderLifeDiagnostics(job) {
+  if (!el.lifeDraftDiagnostics) return;
+  const rows = [];
+  const publish = acceptedLifeDiagnostic(job?.publish_diagnostic, new Set(["controller_call", "result_processing", "bookkeeping"]));
+  const preview = acceptedLifeDiagnostic(job?.preview_diagnostic, new Set(["preview_read", "preview_raster", "preview_wait"]));
+  if (publish) rows.push(`发布结果仍按“${job?.publish_state === "unknown" ? "未确认" : "已记录状态"}”处理；诊断：${publish.code}：${lifeDiagnosticMessages[publish.code]}（${publish.phase}，编号 ${publish.id}）。`);
+  if (preview) rows.push(`仅图片预览诊断（不说明发布原因）：${preview.code}：${lifeDiagnosticMessages[preview.code]}（${preview.phase}，编号 ${preview.id}）；原草稿媒体仍保留。`);
+  const previewReference = job?.preview_diagnostic_reference;
+  if (!preview && previewReference && Object.hasOwn(lifeDiagnosticMessages, previewReference.code) && /^[0-9a-f]{12}$/.test(previewReference.id || "")) {
+    rows.push(`仅图片预览诊断：${previewReference.code}：${lifeDiagnosticMessages[previewReference.code]}（阶段待任务状态查询确认，编号 ${previewReference.id}）；原草稿媒体仍保留。`);
+  }
+  el.lifeDraftDiagnostics.textContent = rows.join(" ");
+  el.lifeDraftDiagnostics.hidden = rows.length === 0;
+}
+
 function renderLifeDraft() {
   const job = state.lifeJob;
   if (!el.generateLifeDraft || !el.lifeDraftResult) return;
@@ -2046,6 +2082,7 @@ function renderLifeDraft() {
   el.generateLifeDraft.disabled = state.lifeRequestPending || job?.state === "running" || !state.status?.login?.uin;
   el.generateLifeDraft.setAttribute("aria-busy", String(Boolean(state.lifeRequestPending || job?.state === "running")));
   el.lifeDraftResult.hidden = job?.state !== "succeeded" && !state.lifeAssociation;
+  renderLifeDiagnostics(job);
   if (el.discardLifeDraft) {
     el.discardLifeDraft.hidden = !state.lifeAssociation;
     el.discardLifeDraft.disabled = state.publishPending || state.lifeLoadPending || state.pendingUploads > 0;
@@ -2129,9 +2166,15 @@ async function renderLifeDraftPreviews(job) {
       const preview = await apiGet("page/life-draft-preview", { job_id: job.id, media_id: item.media_id });
       if (state.lifeJob === job && state.lifeJob.state === "succeeded" && preview.data_url) image.src = preview.data_url;
       else image.alt = "预览暂不可用";
-    } catch (_) {
+    } catch (error) {
       image.alt = "预览暂不可用";
       figure.classList.add("is-unavailable");
+      const diagnosticMatch = /([A-Z_]+) ([0-9a-f]{12})$/.exec(String(error?.message || ""));
+      if (diagnosticMatch && Object.hasOwn(lifeDiagnosticMessages, diagnosticMatch[1])
+          && state.lifeJob === job && Number(state.status?.login?.uin || 0) === Number(job.account_uin)) {
+        job.preview_diagnostic_reference = { code: diagnosticMatch[1], id: diagnosticMatch[2] };
+        renderLifeDiagnostics(job);
+      }
     }
   }
 }

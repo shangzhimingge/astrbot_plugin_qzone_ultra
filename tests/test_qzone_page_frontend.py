@@ -42,6 +42,16 @@ def test_life_confirmation_uses_accessible_in_page_dialog() -> None:
     assert "@media (max-width: 560px)" in css
 
 
+def test_life_diagnostics_are_persistent_safe_status_text() -> None:
+    html = (ROOT / "pages" / "qzone" / "index.html").read_text(encoding="utf-8")
+    app = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
+    assert 'id="lifeDraftDiagnostics"' in html and 'aria-live="polite"' in html
+    assert "renderLifeDiagnostics(job)" in app and "el.lifeDraftDiagnostics.textContent" in app
+    assert "publish_diagnostic" in app and "preview_diagnostic" in app
+    assert "不说明发布原因" in app
+    assert "el.lifeDraftDiagnostics.innerHTML" not in app
+
+
 def test_page_theme_uses_astrbot_context_not_system_fallback() -> None:
     app = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
     css = (ROOT / "pages" / "qzone" / "style.css").read_text(encoding="utf-8")
@@ -116,7 +126,7 @@ def test_page_frontend_reply_uses_inline_form_and_cached_detail(tmp_path: Path) 
     harness = tmp_path / "qzone_page_harness.mjs"
     app_source = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
     instrumented_app = tmp_path / "qzone_app_instrumented.mjs"
-    instrumented_app.write_text(app_source.replace("\ninit();", "\nglobalThis.__qzoneTest = { state, el, publish, discardLifeDraftAssociation };\ninit();"), encoding="utf-8")
+    instrumented_app.write_text(app_source.replace("\ninit();", "\nglobalThis.__qzoneTest = { state, el, publish, discardLifeDraftAssociation, renderLifeDraft, renderLifeDraftPreviews };\ninit();"), encoding="utf-8")
     harness.write_text(
         r'''
 import { pathToFileURL } from "node:url";
@@ -293,6 +303,7 @@ for (const id of [
   "generateLifeDraft",
   "lifeDraftStatus",
   "lifeDraftResult",
+  "lifeDraftDiagnostics",
   "lifeDraftPreview",
   "lifeDraftLongContent",
   "loadLifeDraft",
@@ -358,6 +369,7 @@ let lifePublishPosts = 0;
 let deferLifeGet = false;
 let releaseLifeGet;
 let freshLifeGetStarted;
+let rejectLifePreview = false;
 const lifeJob = { id: "life-confirm-1", draft_id: "draft-confirm-1", account_uin: 10001, state: "succeeded", publish_state: "ready", content: "review this life draft", media: [], has_media: false };
 let detailResolve;
 let detailApiCalls = 0;
@@ -431,7 +443,9 @@ globalThis.window = {
         if (deferLifeGet) return new Promise(resolve => { releaseLifeGet = resolve; });
         return Promise.resolve({ ...lifeJob });
       }
-      if (endpoint === "page/life-draft-preview") return Promise.resolve({ data_url: "data:image/png;base64,AA==" });
+      if (endpoint === "page/life-draft-preview") return rejectLifePreview
+        ? Promise.reject(new Error("图片预览暂不可用。REMOTE_POLICY_FAILED 0123456789ab"))
+        : Promise.resolve({ data_url: "data:image/png;base64,AA==" });
       throw new Error(`unexpected GET ${endpoint}`);
     },
     apiPost(endpoint, body) {
@@ -742,6 +756,25 @@ acceptAction.handlers.click();
 await discarded;
 if (qz.state.lifeAssociation !== null || elements.get("publishContent").value !== "") {
   throw new Error("confirmed discard after account change did not clear the stale local composition");
+}
+
+qz.state.lifeJob = {
+  ...lifeJob, publish_state: "unknown",
+  publish_diagnostic: { id: "abcdef012345", code: "DAEMON_UNAVAILABLE", phase: "controller_call", message: "ignored arbitrary server text TOKEN", at: 1 },
+  preview_diagnostic: { id: "fedcba987654", code: "REMOTE_POLICY_FAILED", phase: "preview_read", message: "untrusted", at: 1 },
+};
+qz.renderLifeDraft();
+const diagnostics = elements.get("lifeDraftDiagnostics").textContent;
+if (!diagnostics.includes("abcdef012345") || !diagnostics.includes("fedcba987654") || !diagnostics.includes("不说明发布原因")) {
+  throw new Error(`persistent diagnostic records were not rendered: ${diagnostics}`);
+}
+if (diagnostics.includes("TOKEN") || diagnostics.includes("ignored arbitrary server text")) throw new Error("diagnostic rendering trusted an arbitrary message");
+rejectLifePreview = true;
+qz.state.status.login.uin = 10001;
+qz.state.lifeJob = { ...lifeJob, media: [{ media_id: "opaque-preview-id", name: "preview.png" }], has_media: true };
+await qz.renderLifeDraftPreviews(qz.state.lifeJob);
+if (qz.state.lifeJob.preview_diagnostic_reference?.id !== "0123456789ab" || !elements.get("lifeDraftDiagnostics").textContent.includes("0123456789ab")) {
+  throw new Error(`message-only preview error was not safely retained in persistent status: ${JSON.stringify({ref:qz.state.lifeJob.preview_diagnostic_reference,status:qz.state.status,owner:qz.state.lifeJob.account_uin,text:elements.get("lifeDraftDiagnostics").textContent})}`);
 }
 ''',
         encoding="utf-8",

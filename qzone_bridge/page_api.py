@@ -18,12 +18,13 @@ import mimetypes
 import re
 import secrets
 import time
+import httpx
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 from urllib.parse import unquote_to_bytes, urlparse
 
-from .errors import DaemonUnavailableError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError
+from .errors import DaemonUnavailableError, QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .media import (
     QZONE_IMAGE_SUFFIXES,
     QZONE_MAX_IMAGES,
@@ -38,7 +39,7 @@ from .media import (
 from .models import FeedEntry
 from .social import QzoneComment, QzonePost, dedupe_image_sources, post_from_entry
 from .local_media import resolve_trusted_local_media_path
-from .page_life import PageLifeError, PageLifeJob, PageLifeJobStore
+from .page_life import DIAGNOSTIC_MESSAGES, PageLifeError, PageLifeJob, PageLifeJobStore, public_diagnostic
 from .page_media import open_page_media_stream
 from .utils import truncate
 
@@ -56,6 +57,48 @@ PAGE_LIFE_PREVIEW_MAX_PIXELS = 20_000_000
 PAGE_LIFE_PREVIEW_MAX_EDGE = 512
 PAGE_LIFE_PREVIEW_MAX_JPEG_BYTES = 128 * 1024
 PAGE_LIFE_PREVIEW_TIMEOUT_SECONDS = 10.0
+
+
+class _PreviewDiagnosticError(ValueError):
+    def __init__(self, code: str, phase: str = "preview_read") -> None:
+        self.code = code
+        self.phase = phase
+
+
+def _safe_diagnostic(error: BaseException, phase: str) -> dict[str, Any]:
+    """Classify by exact known types only; never inspect exception text or arbitrary attributes."""
+    code = "INTERNAL_ERROR"
+    try:
+        error_type = type(error)
+        if error_type is TypeError:
+            code = "INTERFACE_ERROR"
+        elif (error_type is asyncio.TimeoutError or error_type is TimeoutError
+              or error_type is httpx.TimeoutException or error_type is httpx.ConnectTimeout
+              or error_type is httpx.ReadTimeout or error_type is httpx.WriteTimeout
+              or error_type is httpx.PoolTimeout):
+            code = "TIMEOUT"
+        elif error_type is asyncio.CancelledError:
+            code = "CANCELLED"
+        elif error_type is QzoneRequestError:
+            code = "REQUEST_ERROR"
+        elif error_type is QzoneParseError:
+            code = "SOURCE_OR_FORMAT_ERROR"
+        elif error_type is QzoneAuthError or error_type is QzoneNeedsRebind:
+            code = "AUTH_REQUIRED"
+        elif error_type is DaemonUnavailableError:
+            code = "DAEMON_UNAVAILABLE"
+        elif error_type is _PreviewDiagnosticError:
+            candidate = object.__getattribute__(error, "code")
+            if type(candidate) is str and candidate in DIAGNOSTIC_MESSAGES:
+                code = candidate
+            phase_value = object.__getattribute__(error, "phase")
+            if type(phase_value) is str and phase_value in {"preview_read", "preview_raster", "preview_wait"}:
+                phase = phase_value
+    except BaseException:
+        # A hostile exception implementation must not leave a job in `sending`.
+        code = "INTERNAL_ERROR"
+    return {"id": secrets.token_hex(6), "code": code, "phase": phase,
+            "message": DIAGNOSTIC_MESSAGES[code], "at": time.time()}
 
 
 @dataclass(slots=True)
@@ -416,12 +459,26 @@ class QzonePageApi:
             try:
                 cached = await asyncio.shield(task)
             except asyncio.CancelledError:
+                diagnostic = _safe_diagnostic(asyncio.CancelledError(), "preview_wait")
+                await self._life_jobs.mark_preview_diagnostic(job.id, media_id, diagnostic)
                 if not task.done():
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
                 raise
-            except Exception:
-                raise PageLifeError("LIFE_PREVIEW_UNAVAILABLE", "日常草稿图片预览暂不可用。") from None
+            except Exception as error:
+                # Revalidate ownership and retention before exposing a failure from a slower read/raster task.
+                _, current_uin = await self._life_owner_status()
+                if current_uin != account_uin:
+                    raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，不能读取该日常草稿预览。") from None
+                await self._life_jobs.get(job_id, current_uin)
+                diagnostic = _safe_diagnostic(error, "preview_read")
+                if type(error) is _PreviewDiagnosticError:
+                    diagnostic = _safe_diagnostic(error, "preview_read")
+                diagnostic = await self._life_jobs.mark_preview_diagnostic(job.id, media_id, diagnostic)
+                if diagnostic is None:
+                    raise PageLifeError("LIFE_PREVIEW_UNAVAILABLE", "日常草稿图片预览暂不可用。") from None
+                raise PageLifeError("LIFE_PREVIEW_UNAVAILABLE",
+                    f"日常草稿图片预览暂不可用。{diagnostic['code']} {diagnostic['id']}") from None
             finally:
                 if task.done():
                     self._life_preview_inflight.pop(key, None)
@@ -439,58 +496,64 @@ class QzonePageApi:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            raise ValueError("preview unavailable") from None
+        except asyncio.TimeoutError:
+            raise _PreviewDiagnosticError("PREVIEW_TIMEOUT", "preview_wait") from None
 
     async def _life_make_thumbnail_bounded(self, job: PageLifeJob, media_id: str) -> bytes:
         async with self._life_preview_slots:
             media = job.media_sources.get(media_id)
             if not isinstance(media, dict):
-                raise ValueError("preview source missing")
+                raise _PreviewDiagnosticError("SOURCE_MISSING")
             source = str(media.get("source") or "")
 
             async def read_source() -> bytes:
                 scheme = urlparse(source).scheme.lower()
                 if scheme in {"http", "https"}:
-                    stream, _status, _headers = await open_page_media_stream(media)
+                    try:
+                        stream, _status, _headers = await open_page_media_stream(media)
+                    except QzoneParseError:
+                        raise _PreviewDiagnosticError("REMOTE_POLICY_FAILED") from None
                     chunks: list[bytes] = []
                     total = 0
                     try:
                         async for chunk in stream:
                             total += len(chunk)
                             if total > PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES:
-                                raise ValueError("source too large")
+                                raise _PreviewDiagnosticError("SOURCE_TOO_LARGE")
                             chunks.append(chunk)
                     finally:
                         await stream.aclose()
                     return b"".join(chunks)
                 if scheme in {"data", "base64"} or source.startswith("base64://"):
                     if len(source) > (PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES * 4 // 3) + 4096:
-                        raise ValueError("encoded source too large")
+                        raise _PreviewDiagnosticError("ENCODED_SOURCE_TOO_LARGE")
                     data, _mime = self._decode_upload_source(source)
                     if len(data) > PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES:
-                        raise ValueError("source too large")
+                        raise _PreviewDiagnosticError("SOURCE_TOO_LARGE")
                     return data
                 if media.get("trusted_local"):
                     path = resolve_trusted_local_media_path(source, name=str(media.get("name") or ""), suffixes=QZONE_IMAGE_SUFFIXES)
                     if path is None:
-                        raise ValueError("local source missing")
+                        raise _PreviewDiagnosticError("SOURCE_MISSING")
                     return await asyncio.to_thread(lambda: path.open("rb").read(PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES + 1))
-                raise ValueError("untrusted preview source")
+                raise _PreviewDiagnosticError("SOURCE_UNTRUSTED")
 
             try:
                 data = await read_source()
                 if not data or len(data) > PAGE_LIFE_PREVIEW_MAX_SOURCE_BYTES:
-                    raise ValueError("source too large")
-                result = await asyncio.to_thread(self._rasterize_life_preview, data)
+                    raise _PreviewDiagnosticError("SOURCE_TOO_LARGE")
+                try:
+                    result = await asyncio.to_thread(self._rasterize_life_preview, data)
+                except _PreviewDiagnosticError:
+                    raise
+                except Exception:
+                    raise _PreviewDiagnosticError("RASTER_DECODE_FAILED", "preview_raster") from None
                 if self._life_closed or not await self._life_jobs.can_cache_thumbnail(job.id):
                     raise asyncio.CancelledError
                 job.thumbnail_cache[media_id] = result
                 return result
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                raise ValueError("preview unavailable") from None
 
     @staticmethod
     def _rasterize_life_preview(data: bytes) -> bytes:
@@ -498,10 +561,10 @@ class QzonePageApi:
 
         with Image.open(io.BytesIO(data)) as image:
             if image.format not in {"JPEG", "PNG", "WEBP", "GIF", "BMP"}:
-                raise ValueError("unsupported raster")
+                raise _PreviewDiagnosticError("RASTER_UNSUPPORTED", "preview_raster")
             width, height = image.size
             if width <= 0 or height <= 0 or width * height > PAGE_LIFE_PREVIEW_MAX_PIXELS:
-                raise ValueError("pixel limit")
+                raise _PreviewDiagnosticError("PIXEL_LIMIT", "preview_raster")
             image.seek(0)
             image = ImageOps.exif_transpose(image).convert("RGB")
             image.thumbnail((PAGE_LIFE_PREVIEW_MAX_EDGE, PAGE_LIFE_PREVIEW_MAX_EDGE), Image.Resampling.LANCZOS)
@@ -511,7 +574,7 @@ class QzonePageApi:
                 result = output.getvalue()
                 if len(result) <= PAGE_LIFE_PREVIEW_MAX_JPEG_BYTES:
                     return result
-        raise ValueError("thumbnail too large")
+        raise _PreviewDiagnosticError("OUTPUT_TOO_LARGE", "preview_raster")
 
     async def close(self) -> None:
         self._life_closed = True
@@ -1055,6 +1118,7 @@ class QzonePageApi:
                 return _success(dict(life_job.publish_result or {}), message="说说已发布。")
             media = canonical_media
         dispatched = False
+        publish_phase = "controller_call"
         try:
             kwargs = {
                 "content": content,
@@ -1066,6 +1130,7 @@ class QzonePageApi:
                 kwargs["expected_login_uin"] = life_job.account_uin
             dispatched = True
             payload = await self.controller.publish_post(**kwargs)
+            publish_phase = "result_processing"
             data = {
                 "message": "说说已发布。" if life_job is not None else (payload.get("message") or "说说已发布。"),
                 "media_count": _to_int(payload.get("media_count"), len(media)),
@@ -1101,18 +1166,24 @@ class QzonePageApi:
                     "can_delete": True,
                 }
             if life_job is not None:
+                publish_phase = "bookkeeping"
                 marked = await asyncio.shield(self._life_jobs.mark_published(life_job.id, data))
                 if not marked:
-                    await asyncio.shield(self._life_jobs.mark_unknown(life_job.id))
+                    diagnostic = _safe_diagnostic(RuntimeError(), "bookkeeping")
+                    await asyncio.shield(self._life_jobs.mark_unknown(life_job.id, diagnostic=diagnostic))
             return _success(data, message="说说已发布。")
         except asyncio.CancelledError:
             if life_job is not None and dispatched:
-                await asyncio.shield(self._life_jobs.mark_unknown(life_job.id))
+                diagnostic = _safe_diagnostic(asyncio.CancelledError(), publish_phase)
+                await asyncio.shield(self._life_jobs.mark_unknown(life_job.id, diagnostic=diagnostic))
             raise
-        except Exception:
+        except Exception as error:
             if life_job is not None and dispatched:
-                await asyncio.shield(self._life_jobs.mark_unknown(life_job.id))
-                raise PageLifeError("LIFE_UNKNOWN", "发布结果尚不确定，请查询空间状态；系统不会自动重试。") from None
+                diagnostic = _safe_diagnostic(error, publish_phase)
+                await asyncio.shield(self._life_jobs.mark_unknown(life_job.id, diagnostic=diagnostic))
+                retained = public_diagnostic(life_job.publish_diagnostic) or diagnostic
+                raise PageLifeError("LIFE_UNKNOWN",
+                    f"发布结果尚不确定，请查询空间状态；系统不会自动重试。{retained['code']} {retained['id']}") from None
             raise
 
     async def like(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
