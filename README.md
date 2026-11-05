@@ -8,6 +8,8 @@ QQ空间Ultra 是一个面向 AstrBot 的 QQ 空间插件，提供中文命令�
 
 本 Fork 的可安装源码仓库为 [shangzhimingge/astrbot_plugin_qzone_ultra](https://github.com/shangzhimingge/astrbot_plugin_qzone_ultra)。本页标出的 Fork 增量功能是本仓库维护的改动；上游来源与致谢见上文。
 
+Pages 中 Life 草稿载入、清空和确认发布使用插件页内确认框，以兼容 AstrBot 限制原生浏览器确认弹窗的 iframe。Life 发布在确认后会重新核对账号、草稿和编辑器快照；普通说说发布仍沿用原有交互。
+
 ## 此 Fork 的增量功能
 
 以下是此 Fork 新增的功能，不代表上游仓库已有同样实现：LLM 文本生成继承 AstrBot 当前选中人格，并可在最终文案阶段执行有界一致性复核；Life 图像提示可继承经严格来源片段校验的视觉属性；Pages 中“AI 生成评论/回复”只生成可编辑草稿，不会自动提交；Pages 说说编辑器可生成 Life 日常草稿，保存后须用户载入、编辑并明确确认发布；可选的“自动回复自己说说的新评论”默认关闭，启用后首次成功扫描会先为现有评论建立基线，并对发送前再次确认的新增评论执行限额回复。自动回评状态保存在插件数据目录 `auto_reply_state.json`；遇到发送结果不确定时会保留状态并避免自动重发。

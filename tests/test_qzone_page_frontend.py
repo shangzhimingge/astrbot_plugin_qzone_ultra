@@ -20,6 +20,28 @@ def test_page_header_removes_brand_block() -> None:
     assert '<script src="/api/plugin/page/bridge-sdk.js"></script>' in html
 
 
+def test_life_confirmation_uses_accessible_in_page_dialog() -> None:
+    html = (ROOT / "pages" / "qzone" / "index.html").read_text(encoding="utf-8")
+    app = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
+    css = (ROOT / "pages" / "qzone" / "style.css").read_text(encoding="utf-8")
+
+    assert '<dialog id="actionConfirmDialog"' in html
+    assert 'aria-labelledby="actionConfirmTitle"' in html
+    assert 'aria-describedby="actionConfirmMessage"' in html
+    assert 'id="actionConfirmCancel"' in html and 'id="actionConfirmAccept"' in html
+    assert 'window.confirm(' not in app
+    assert "beginActionConfirmation" in app and "settleActionConfirmation" in app
+    assert 'apiGet("page/life-draft", { id: jobId })' in app
+    assert "actionToken" in app and "composerRevision" in app
+    assert 'window.addEventListener("pagehide", cancelActiveActionConfirmation)' in app
+    assert "state.confirmationToken === actionToken" in app
+    assert 'dialog.addEventListener("keydown", token.onKeydown)' in app
+    assert 'el.actionConfirmDialog?.removeEventListener?.("keydown", token.onKeydown)' in app
+    assert ".action-confirm-dialog::backdrop" in css
+    assert "max-height: calc(100dvh - 32px)" in css
+    assert "@media (max-width: 560px)" in css
+
+
 def test_page_theme_uses_astrbot_context_not_system_fallback() -> None:
     app = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
     css = (ROOT / "pages" / "qzone" / "style.css").read_text(encoding="utf-8")
@@ -92,6 +114,9 @@ def test_ai_draft_buttons_are_accessible_and_inline_reply_actions_remain_tappabl
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is required for the frontend smoke test")
 def test_page_frontend_reply_uses_inline_form_and_cached_detail(tmp_path: Path) -> None:
     harness = tmp_path / "qzone_page_harness.mjs"
+    app_source = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
+    instrumented_app = tmp_path / "qzone_app_instrumented.mjs"
+    instrumented_app.write_text(app_source.replace("\ninit();", "\nglobalThis.__qzoneTest = { state, el, publish, discardLifeDraftAssociation };\ninit();"), encoding="utf-8")
     harness.write_text(
         r'''
 import { pathToFileURL } from "node:url";
@@ -165,6 +190,20 @@ class Element {
     this.handlers[name] = handler;
   }
 
+  removeEventListener(name, handler) {
+    if (this.handlers[name] === handler) delete this.handlers[name];
+  }
+
+  showModal() {
+    this.showModalCalls = (this.showModalCalls || 0) + 1;
+    this.open = true;
+  }
+
+  close() {
+    this.open = false;
+    this.handlers.close?.();
+  }
+
   setAttribute(name, value) {
     this[name] = String(value);
   }
@@ -175,6 +214,7 @@ class Element {
 
   focus() {
     this.focused = true;
+    if (globalThis.document) globalThis.document.activeElement = this;
   }
 
   querySelector(selector) {
@@ -250,9 +290,25 @@ for (const id of [
   "detailPane",
   "detailEmpty",
   "detailContent",
+  "generateLifeDraft",
+  "lifeDraftStatus",
+  "lifeDraftResult",
+  "lifeDraftPreview",
+  "lifeDraftLongContent",
+  "loadLifeDraft",
+  "discardLifeDraft",
+  "actionConfirmDialog",
+  "actionConfirmTitle",
+  "actionConfirmMessage",
+  "actionConfirmFeedback",
+  "actionConfirmCancel",
+  "actionConfirmAccept",
+  "charCounter",
 ]) {
   elements.set(id, new Element(id));
 }
+elements.get("actionConfirmCancel").textContent = "取消";
+elements.get("actionConfirmAccept").textContent = "确认发布";
 
 const account = new Element("account");
 account.className = "account";
@@ -270,6 +326,8 @@ const tabs = ["friends", "self", "profile"].map((scope) => {
 });
 
 globalThis.document = {
+  activeElement: null,
+  hidden: false,
   documentElement: documentRoot,
   body: new Element("body"),
   getElementById(id) {
@@ -296,6 +354,11 @@ let commentPayload = null;
 let rejectComment;
 let deletePayload = null;
 let publishPayload = null;
+let lifePublishPosts = 0;
+let deferLifeGet = false;
+let releaseLifeGet;
+let freshLifeGetStarted;
+const lifeJob = { id: "life-confirm-1", draft_id: "draft-confirm-1", account_uin: 10001, state: "succeeded", publish_state: "ready", content: "review this life draft", media: [], has_media: false };
 let detailResolve;
 let detailApiCalls = 0;
 const detailPromise = new Promise((resolve) => {
@@ -329,7 +392,7 @@ globalThis.window = {
     return setTimeout(handler, 0);
   },
   addEventListener(name, handler) {
-    windowHandlers.set(name, handler);
+    windowHandlers.set(name, [...(windowHandlers.get(name) || []), handler]);
   },
   prompt() {
     promptCalls += 1;
@@ -343,7 +406,7 @@ globalThis.window = {
     ready() {
       return Promise.resolve({ pluginName: "astrbot_plugin_qzone_ultra", pageName: "qzone", uiTheme: "PurpleThemeDark" });
     },
-    apiGet(endpoint) {
+    apiGet(endpoint, params = {}) {
       if (endpoint === "page/status") {
         return Promise.resolve({
           daemon: { state: "ready", version: "0.4.3" },
@@ -362,6 +425,13 @@ globalThis.window = {
         detailApiCalls += 1;
         return detailPromise;
       }
+      if (endpoint === "page/life-draft") {
+        if (!params.id) return Promise.resolve({ ...lifeJob });
+        freshLifeGetStarted?.();
+        if (deferLifeGet) return new Promise(resolve => { releaseLifeGet = resolve; });
+        return Promise.resolve({ ...lifeJob });
+      }
+      if (endpoint === "page/life-draft-preview") return Promise.resolve({ data_url: "data:image/png;base64,AA==" });
       throw new Error(`unexpected GET ${endpoint}`);
     },
     apiPost(endpoint, body) {
@@ -385,6 +455,7 @@ globalThis.window = {
       }
       if (endpoint === "page/publish") {
         publishPayload = body;
+        if (body.life_job_id) lifePublishPosts += 1;
         return Promise.resolve({
           post: {
             ...feedPost,
@@ -419,13 +490,13 @@ await new Promise((resolve) => setTimeout(resolve, 30));
 if (documentRoot.dataset.theme !== "dark" || documentRoot.style.colorScheme !== "dark" || !documentRoot.classList.contains("v-theme--dark")) {
   throw new Error(`theme did not follow bridge context: ${documentRoot.dataset.theme}/${documentRoot.style.colorScheme}`);
 }
-windowHandlers.get("message")?.({
+windowHandlers.get("message")?.forEach(handler => handler({
   data: {
     channel: "astrbot-plugin-page",
     kind: "context",
     context: { uiTheme: "PurpleTheme" },
   },
-});
+}));
 await new Promise((resolve) => setTimeout(resolve, 30));
 if (documentRoot.dataset.theme !== "light" || documentRoot.style.colorScheme !== "light" || !documentRoot.classList.contains("v-theme--light")) {
   throw new Error(`theme did not follow AstrBot theme update: ${documentRoot.dataset.theme}/${documentRoot.style.colorScheme}`);
@@ -563,6 +634,9 @@ if (publishPayload.media?.[0]?.upload_id !== "upload-token-1") {
 if ("preview_url" in publishPayload.media[0] || "previewUrl" in publishPayload.media[0]) {
   throw new Error(`preview url leaked into publish payload: ${JSON.stringify(publishPayload)}`);
 }
+if (confirmCalls !== 0) {
+  throw new Error("ordinary publish unexpectedly requested a confirmation");
+}
 
 const deleteButton = byText(elements.get("detailContent"), "删除");
 if (!deleteButton) throw new Error("delete button was not rendered");
@@ -582,12 +656,99 @@ await new Promise((resolve) => setTimeout(resolve, 0));
 if (!deletePayload || deletePayload.id !== "post_1") {
   throw new Error(`delete payload was wrong: ${JSON.stringify(deletePayload)}`);
 }
+
+const qz = globalThis.__qzoneTest;
+qz.state.status = { login: { uin: 10001 } };
+qz.state.lifeJob = { ...lifeJob };
+qz.state.lifeAssociation = { jobId: lifeJob.id, accountUin: 10001, uncertain: false };
+elements.get("publishContent").value = lifeJob.content;
+const dialog = elements.get("actionConfirmDialog");
+const submitLife = () => qz.publish({ preventDefault() {} });
+const cancelAction = elements.get("actionConfirmCancel");
+const acceptAction = elements.get("actionConfirmAccept");
+
+const cancelledLife = submitLife();
+await new Promise(resolve => setTimeout(resolve, 0));
+if (!dialog.open) throw new Error("Life publish did not open the in-page confirmation");
+cancelAction.handlers.click();
+await cancelledLife;
+if (lifePublishPosts !== 0) throw new Error("cancelled Life publish dispatched a request");
+
+// Model the close event from the previous modal arriving after a new one opens.
+const nativeClose = dialog.close.bind(dialog);
+dialog.close = () => { nativeClose(); setTimeout(() => dialog.handlers.close?.(), 15); };
+const staleCloseFirst = submitLife();
+await new Promise(resolve => setTimeout(resolve, 0));
+cancelAction.handlers.click();
+await staleCloseFirst;
+const staleCloseSecond = submitLife();
+await new Promise(resolve => setTimeout(resolve, 0));
+const modalCount = dialog.showModalCalls;
+await new Promise(resolve => setTimeout(resolve, 25));
+if (!dialog.open || dialog.showModalCalls !== modalCount) throw new Error("queued stale close cancelled a later confirmation");
+cancelAction.handlers.click();
+await staleCloseSecond;
+dialog.close = nativeClose;
+
+deferLifeGet = true;
+let announceJobSwitchGet;
+const jobSwitchGetStarted = new Promise(resolve => { announceJobSwitchGet = resolve; });
+freshLifeGetStarted = announceJobSwitchGet;
+const jobSwitchPublish = submitLife();
+await new Promise(resolve => setTimeout(resolve, 0));
+acceptAction.handlers.click();
+await jobSwitchGetStarted;
+const replacementJob = { id: "life-confirm-replacement", draft_id: "draft-replacement", account_uin: 10001, state: "succeeded", publish_state: "ready", content: "replacement", media: [], has_media: false };
+qz.state.lifeJob = replacementJob;
+releaseLifeGet({ ...lifeJob });
+await jobSwitchPublish;
+if (lifePublishPosts !== 0 || qz.state.lifeJob !== replacementJob) {
+  throw new Error("fresh GET overwrote a replacement selected job or published the old job");
+}
+qz.state.lifeJob = { ...lifeJob };
+
+// The captured action token remains live until its fresh GET completes.
+let announceFreshGet;
+const freshGetStarted = new Promise(resolve => { announceFreshGet = resolve; });
+freshLifeGetStarted = announceFreshGet;
+const pagehideLife = submitLife();
+await new Promise(resolve => setTimeout(resolve, 0));
+const openCount = dialog.showModalCalls;
+const duplicateLife = submitLife();
+await duplicateLife;
+if (dialog.showModalCalls !== openCount) throw new Error("duplicate Life submit opened another confirmation");
+acceptAction.handlers.click();
+await freshGetStarted;
+windowHandlers.get("pagehide")?.forEach(handler => handler());
+releaseLifeGet({ ...lifeJob });
+await pagehideLife;
+if (lifePublishPosts !== 0) throw new Error("pagehide during fresh GET allowed a Life publish");
+
+// A completed approval posts one exact immutable request.
+deferLifeGet = false;
+freshLifeGetStarted = null;
+const acceptedLife = submitLife();
+await new Promise(resolve => setTimeout(resolve, 0));
+acceptAction.handlers.click();
+await acceptedLife;
+if (lifePublishPosts !== 1 || publishPayload?.life_job_id !== lifeJob.id || publishPayload?.content !== lifeJob.content) {
+  throw new Error(`accepted Life publish was not one exact captured request: ${JSON.stringify(publishPayload)}`);
+}
+
+qz.state.status.login.uin = 20002;
+const discarded = qz.discardLifeDraftAssociation();
+await new Promise(resolve => setTimeout(resolve, 0));
+acceptAction.handlers.click();
+await discarded;
+if (qz.state.lifeAssociation !== null || elements.get("publishContent").value !== "") {
+  throw new Error("confirmed discard after account change did not clear the stale local composition");
+}
 ''',
         encoding="utf-8",
     )
 
     subprocess.run(
-        ["node", str(harness), str(ROOT / "pages" / "qzone" / "app.js")],
+        ["node", str(harness), str(instrumented_app)],
         check=True,
         cwd=ROOT,
     )

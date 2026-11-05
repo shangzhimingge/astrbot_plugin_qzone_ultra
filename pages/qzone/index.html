@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>QQ空间Ultra</title>
-    <link rel="stylesheet" href="./style.css?v=2026110502-life-draft" />
+    <link rel="stylesheet" href="./style.css?v=2026110503-confirm" />
   </head>
   <body>
     <div id="toastContainer" class="toast-container" aria-live="polite"></div>
@@ -98,7 +98,19 @@
       </aside>
     </main>
 
+    <dialog id="actionConfirmDialog" class="action-confirm-dialog" aria-labelledby="actionConfirmTitle" aria-describedby="actionConfirmMessage">
+      <div class="action-confirm-content">
+        <h2 id="actionConfirmTitle">请确认操作</h2>
+        <p id="actionConfirmMessage"></p>
+        <p id="actionConfirmFeedback" class="action-confirm-feedback" role="status" aria-live="polite"></p>
+        <div class="action-confirm-actions">
+          <button id="actionConfirmCancel" class="ghost" type="button">取消</button>
+          <button id="actionConfirmAccept" class="primary" type="button">确认</button>
+        </div>
+      </div>
+    </dialog>
+
     <script src="/api/plugin/page/bridge-sdk.js"></script>
-    <script type="module" src="./app.js?v=2026110502-life-draft"></script>
+    <script type="module" src="./app.js?v=2026110503-confirm"></script>
   </body>
 </html>

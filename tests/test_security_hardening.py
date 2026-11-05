@@ -323,9 +323,9 @@ def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeyp
 
     main = _import_main_with_stubs(monkeypatch)
     metadata = Path("metadata.yaml").read_text(encoding="utf-8")
-    assert qzone_bridge.__version__ == "0.9.5"
-    assert "version: 0.9.5" in metadata
-    assert qzone_bridge.BRIDGE_API_VERSION == 2026110502
+    assert qzone_bridge.__version__ == "0.9.6"
+    assert "version: 0.9.6" in metadata
+    assert qzone_bridge.BRIDGE_API_VERSION == 2026110503
     assert main.REQUIRED_QZONE_BRIDGE_API_VERSION == qzone_bridge.BRIDGE_API_VERSION
 
 
