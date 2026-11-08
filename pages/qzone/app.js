@@ -1997,6 +1997,9 @@ function setLifeDraftStatus(message, tone = "info") {
 }
 
 const LIFE_RECOVERY_SESSION_KEY = "qzoneLifeDraftRecovery";
+const LIFE_PRE_ADMISSION_REJECTIONS = new Set([
+  "LIFE_INVALID_REQUEST", "LIFE_INVALID_OWNER", "LIFE_UNAVAILABLE", "LIFE_CLOSED",
+]);
 
 function invalidateLifeAssociation(message) {
   if (state.lifeAssociation) state.lifeAssociationInvalid = message || "该日常草稿已失效。";
@@ -2251,6 +2254,13 @@ async function startLifeDraft() {
     renderLifeDraft();
     if (job?.state === "running") scheduleLifePoll(job.id);
   } catch (error) {
+    if (LIFE_PRE_ADMISSION_REJECTIONS.has(String(error?.code || ""))) {
+      state.lifeRecovery = null;
+      state.lifeRecoveryExpired = false;
+      saveLifeRecovery();
+      setLifeDraftStatus(error.message || "日常草稿请求未受理。", "warn");
+      return;
+    }
     state.lifeRecovery = { requestId, startedAt: Date.now() };
     state.lifeRecoveryExpired = false;
     saveLifeRecovery();

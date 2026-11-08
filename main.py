@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Awaitable, Callable, Iterable, Iterator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from astrbot.api import logger
@@ -2961,20 +2961,66 @@ class QzoneStablePlugin(Star):
         results: list[dict[str, Any]] = []
         for post in posts:
             comment_text = content.strip()
-            if not comment_text and auto_generate:
-                comment_text = await self._generate_comment_text(event, post)
-            if not comment_text:
-                raise QzoneBridgeError("评论内容为空")
-            payload = await self._post_service().comment_post(post, comment_text, private=private)
+            try:
+                if not comment_text and auto_generate:
+                    comment_text = await self._generate_comment_text(event, post)
+                if not comment_text:
+                    raise PersonaConsistencyError("REVIEW_FAILED")
+                payload = await self._post_service().comment_post(post, comment_text, private=private)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if isinstance(exc, QzoneBridgeError):
+                    public_message = self._error_text(exc)
+                    code = "BRIDGE_ERROR"
+                elif isinstance(exc, GenerationTimeoutError):
+                    public_message = "评论生成或审核超时，当前说说未评论。"
+                    code = "GENERATION_TIMEOUT"
+                elif isinstance(exc, PersonaConsistencyError):
+                    public_message = "评论生成或人格审核未通过，当前说说未评论。"
+                    code = exc.code
+                else:
+                    logger.debug("qzone comment item failed type=%s", type(exc).__name__)
+                    public_message = "评论处理失败，当前说说未评论。"
+                    code = "COMMENT_FAILED"
+                results.append({
+                    "post": QzonePostService.post_payload(post), "status": "failed",
+                    "error": {"code": code, "message": public_message},
+                })
+                continue
             item: dict[str, Any] = {
-                "post": QzonePostService.post_payload(post),
-                "comment": comment_text,
-                "result": payload,
+                "post": QzonePostService.post_payload(post), "comment": comment_text,
+                "result": payload, "status": "sent",
             }
-            if like_after_comment:
-                item["like_result"] = await self._post_service().like_post(post)
+            # Preserve the irreversible success before optional follow-up work.
             results.append(item)
+            if like_after_comment:
+                try:
+                    item["like_result"] = await self._post_service().like_post(post)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    item["like_error"] = {"code": "LIKE_FAILED", "message": "评论已发送，但点赞失败。"}
         return results
+
+    @staticmethod
+    def _comment_tool_payload(results: list[dict[str, Any]]) -> dict[str, Any]:
+        sent = sum(1 for item in results if item.get("status") == "sent")
+        failures = [item.get("error") for item in results if item.get("status") == "failed"]
+        like_failures = [item.get("like_error") for item in results if item.get("like_error")]
+        failed_count = len(failures) + len(like_failures)
+        if sent and failed_count:
+            message = f"已发送 {sent} 条评论，另有 {failed_count} 项未完成。"
+        elif sent:
+            message = f"已发送 {sent} 条评论。"
+        else:
+            message = "本次没有发送评论。"
+        return {
+            "ok": sent > 0,
+            "partial": bool(sent and failed_count),
+            "result": {"message": message, "count": sent, "failed_count": failed_count,
+                       "errors": [*failures, *like_failures]},
+        }
 
     async def _ask_llm_view_reply(
         self,
@@ -3744,12 +3790,16 @@ class QzoneStablePlugin(Star):
         post: PostPayload,
         *,
         sync_weibo: bool,
+        retry_writes: bool = True,
+        expected_login_uin: int | None = None,
     ) -> dict[str, Any]:
         return await self.controller.publish_post(
             content=post.content,
             sync_weibo=sync_weibo,
             media=[item.to_dict() for item in [*post.media, *post.attachments]],
             content_sanitized=True,
+            retry_writes=retry_writes,
+            expected_login_uin=expected_login_uin,
         )
 
     async def _publish_post_payload(
@@ -3758,6 +3808,10 @@ class QzoneStablePlugin(Star):
         *,
         sync_weibo: bool = False,
         event: AstrMessageEvent | None = None,
+        retry_writes: bool = True,
+        expected_login_uin: int | None = None,
+        on_prepared: Callable[[PostPayload], Awaitable[None]] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> tuple[PostPayload, dict[str, Any]]:
         post = await self._prepare_video_sources(post)
         render_post: PostPayload | None = None
@@ -3769,16 +3823,29 @@ class QzoneStablePlugin(Star):
                     "private-create + permission-update + public-verification chain."
                 )
             render_post = await self._prepare_publish_payload(post)
-            payload = await self._publish_daemon_video_post(post, sync_weibo=sync_weibo)
+            if on_prepared is not None:
+                await on_prepared(post)
+            if on_dispatch is not None:
+                on_dispatch()
+            payload = await self._publish_daemon_video_post(
+                post, sync_weibo=sync_weibo, retry_writes=retry_writes,
+                expected_login_uin=expected_login_uin,
+            )
             return render_post, payload
 
         if render_post is None:
             render_post = await self._prepare_publish_payload(post)
+        if on_prepared is not None:
+            await on_prepared(render_post)
+        if on_dispatch is not None:
+            on_dispatch()
         payload = await self.controller.publish_post(
             content=render_post.content,
             sync_weibo=sync_weibo,
             media=[item.to_dict() for item in render_post.media],
             content_sanitized=True,
+            retry_writes=retry_writes,
+            expected_login_uin=expected_login_uin,
         )
         return render_post, payload
 
@@ -5814,7 +5881,7 @@ class QzoneStablePlugin(Star):
                 comment_text=comment_text,
             )
         except Exception as exc:
-            logger.debug("qzone probabilistic read/comment failed: %s", exc)
+            logger.debug("qzone probabilistic read/comment failed type=%s", type(exc).__name__)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("查看访客")
@@ -5901,19 +5968,41 @@ class QzoneStablePlugin(Star):
         comment_texts: dict[int, str] = {}
         commented_posts: list[QzonePost] = []
         for post in posts:
-            content = selection.comment_text or await self._generate_comment_text(event, post)
-            if not content.strip():
-                content = "挺有意思的。"
+            try:
+                content = selection.comment_text or await self._generate_comment_text(event, post)
+                if not content.strip():
+                    raise PersonaConsistencyError("REVIEW_FAILED")
+            except asyncio.CancelledError:
+                raise
+            except GenerationTimeoutError:
+                error_lines.append(f"第 {post.local_id} 条评论未发送：生成或审核超时。")
+                continue
+            except PersonaConsistencyError as exc:
+                label = "额度已用尽" if exc.code == "BUDGET_EXHAUSTED" else "人格审核未通过"
+                error_lines.append(f"第 {post.local_id} 条评论未发送：{label}。")
+                continue
+            except Exception:
+                error_lines.append(f"第 {post.local_id} 条评论未发送：生成失败。")
+                continue
             try:
                 await self._post_service().comment_post(post, content)
+            except asyncio.CancelledError:
+                raise
             except QzoneBridgeError as exc:
                 error_lines.append(f"第 {post.local_id} 条评论失败：{self._error_text(exc)}")
+                continue
+            except Exception:
+                error_lines.append(f"第 {post.local_id} 条评论失败：请求结果待确认。")
                 continue
             if self.settings.like_when_comment:
                 try:
                     await self._post_service().like_post(post)
+                except asyncio.CancelledError:
+                    raise
                 except QzoneBridgeError as exc:
                     error_lines.append(f"第 {post.local_id} 条已评论，但点赞失败：{self._error_text(exc)}")
+                except Exception:
+                    error_lines.append(f"第 {post.local_id} 条已评论，但点赞失败。")
             comment_texts[id(post)] = content
             commented_posts.append(post)
             lines.append(f"已评论第 {post.local_id} 条：{truncate(content, 60)}")
@@ -6020,10 +6109,21 @@ class QzoneStablePlugin(Star):
         post = await self._collect_target_post_payload(event, topic, ("写说说", "写稿"))
         try:
             text = await self._generate_post_text(event, post.content)
+        except asyncio.CancelledError:
+            raise
+        except GenerationTimeoutError:
+            logger.info("qzone write feed generation stopped: deadline")
+            yield self._command_result(event, "稿件生成或审核超时，未创建待审核稿件。")
+            return
+        except PersonaConsistencyError as exc:
+            logger.info("qzone write feed generation stopped code=%s", exc.code)
+            yield self._command_result(event, "稿件生成或人格审核未通过，未创建待审核稿件。")
+            return
         except Exception as exc:
-            logger.warning("qzone write feed generation failed: %s", exc)
-            text = ""
-        post.content = text.strip() or post.content
+            logger.warning("qzone write feed generation failed type=%s", type(exc).__name__)
+            yield self._command_result(event, "稿件生成失败，未创建待审核稿件。")
+            return
+        post.content = text.strip()
         if not post.content.strip() and not post.media:
             yield self._command_result(event, "说说生成失败。")
             return
@@ -6274,7 +6374,7 @@ class QzoneStablePlugin(Star):
             comment = comments[comment_position - 1] if comment_position else comments[-1]
             content = await self._generate_reply_text(event, post, comment)
             if not content.strip():
-                content = "收到啦。"
+                raise PersonaConsistencyError("REVIEW_FAILED")
             async with self._reply_send_lock:
                 payload = await self.controller.reply_comment(
                     hostuin=hostuin,
@@ -6287,6 +6387,15 @@ class QzoneStablePlugin(Star):
                 await self.auto_reply_service.mark_manual_reply(
                     int(status.get("login_uin") or 0), hostuin, fid, comment.commentid, comment.uin
                 )
+        except asyncio.CancelledError:
+            raise
+        except GenerationTimeoutError:
+            yield self._command_result(event, "回复生成或审核超时，未发送回复。")
+            return
+        except PersonaConsistencyError as exc:
+            reason = "生成额度已用尽" if exc.code == "BUDGET_EXHAUSTED" else "人格审核未通过"
+            yield self._command_result(event, f"{reason}，未发送回复。")
+            return
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
@@ -6385,36 +6494,61 @@ class QzoneStablePlugin(Star):
         if draft.status != "pending":
             yield self._command_result(event, f"稿件 #{draft.id} 当前是 {draft.status}，不能过稿。")
             return
-        failure = ""
-
-        def claim_approved(current: DraftPost) -> None:
-            nonlocal failure
-            if current.status != "pending":
-                failure = current.status
-                return
-            current.status = "approved"
-
-        claimed = await self.drafts.update_async(draft.id, claim_approved)
-        if claimed is None:
-            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
-            return
-        if failure:
-            yield self._command_result(event, f"稿件 #{claimed.id} 当前是 {failure}，不能过稿。")
-            return
-        draft = claimed
         post = PostPayload(content=self._draft_publish_content(draft), media=normalize_media_list(draft.media))
         profile_task: asyncio.Task | None = None
+        claim: dict[str, Any] | None = None
+        digest = ""
+        dispatched = False
         try:
             await self._ensure_cookie_ready(event)
+            status = await self.controller.get_status(probe_daemon=False)
+            account_uin = int(status.get("login_uin") or status.get("uin") or 0)
+            if account_uin <= 0 or status.get("needs_rebind"):
+                raise QzoneNeedsRebind("请先绑定有效 QQ 账号后发布稿件。")
+            claim = await self.drafts.claim_publish_async(
+                draft.id,
+                account_uin=account_uin,
+                content=post.content,
+                media=[item.to_dict() for item in post.media],
+                sync_weibo=False,
+                life_job_id=draft.life_job_id,
+                life_owner_uin=draft.life_owner_uin,
+            )
+            if claim.get("state") == "already_published":
+                yield self._command_result(event, f"稿件 #{draft.id} 已发布。")
+                return
+            if claim.get("state") != "acquired":
+                yield self._command_result(event, f"稿件 #{draft.id} 当前发布状态为 {claim.get('state')}，操作已停止。")
+                return
+            digest = str(claim["digest"])
+
+            async def persist_final(prepared: PostPayload) -> None:
+                nonlocal digest
+                final_media = [item.to_dict() for item in [*prepared.media, *prepared.attachments]]
+                next_digest = await self.drafts.snapshot_publish_async(
+                    draft.id, token=str(claim["token"]), account_uin=account_uin,
+                    content=prepared.content, media=final_media, sync_weibo=False,
+                )
+                if not next_digest:
+                    raise RuntimeError("draft publication snapshot was not persisted")
+                digest = next_digest
+
+            def mark_dispatch() -> None:
+                nonlocal dispatched
+                dispatched = True
+
             profile_task = self._schedule_publisher_profile(event)
-            post, payload = await self._publish_post_payload(post, event=event)
+            post, payload = await self._publish_post_payload(
+                post, event=event, retry_writes=False, expected_login_uin=account_uin,
+                on_prepared=persist_final, on_dispatch=mark_dispatch,
+            )
             published_fid = str(payload.get("fid") or "")
-
-            def mark_published(current: DraftPost) -> None:
-                current.status = "published"
-                current.published_fid = published_fid
-
-            updated_draft = await self.drafts.update_async(draft.id, mark_published) or draft
+            if not await self.drafts.complete_publish_async(
+                draft.id, token=str(claim["token"]), account_uin=account_uin,
+                digest=digest, result={**payload, "fid": published_fid},
+            ):
+                raise RuntimeError("draft publication completion was not persisted")
+            updated_draft = await self.drafts.get_async(draft.id) or draft
             if published_fid:
                 login_uin = 0
                 try:
@@ -6431,16 +6565,34 @@ class QzoneStablePlugin(Star):
                 )
                 await self._post_store().upsert_async(saved_post)
             await self._notify_draft_author(event, updated_draft, f"你的投稿 #{updated_draft.id} 已通过并发布。")
-        except QzoneBridgeError as exc:
+        except asyncio.CancelledError:
             if profile_task is not None:
                 profile_task.cancel()
-
-            def rollback_approved(current: DraftPost) -> None:
-                if current.status == "approved":
-                    current.status = "pending"
-
-            await self.drafts.update_async(draft.id, rollback_approved)
-            yield self._command_result(event, self._error_text(exc))
+            if claim is not None:
+                if dispatched:
+                    await asyncio.shield(self.drafts.mark_unknown_async(
+                        draft.id, token=str(claim["token"]), account_uin=account_uin,
+                        digest=digest, diagnostic={"code": "CANCELLED", "phase": "controller_call"},
+                    ))
+                else:
+                    await asyncio.shield(self.drafts.release_publish_async(
+                        draft.id, token=str(claim["token"]), account_uin=account_uin, digest=digest,
+                    ))
+            raise
+        except Exception as exc:
+            if profile_task is not None:
+                profile_task.cancel()
+            if claim is not None:
+                if dispatched:
+                    await self.drafts.mark_unknown_async(
+                        draft.id, token=str(claim["token"]), account_uin=account_uin,
+                        digest=digest, diagnostic={"code": type(exc).__name__, "phase": "controller_call"},
+                    )
+                else:
+                    await self.drafts.release_publish_async(
+                        draft.id, token=str(claim["token"]), account_uin=account_uin, digest=digest,
+                    )
+            yield self._command_result(event, self._error_text(exc) if isinstance(exc, QzoneBridgeError) else "稿件发布失败，状态已保留，请查询后再操作。")
             return
         yield await self._publish_result(event, post, payload, profile_task=profile_task)
 
@@ -6831,15 +6983,14 @@ class QzoneStablePlugin(Star):
                 results.append({"action": "like", "result": result})
             if results:
                 tool = "qzone_comment_post" if wants_comment else "qzone_like_post"
-                payload = {
-                    "ok": True,
-                    "tool": tool,
-                    "result": {
-                        "message": "评论发好了。" if wants_comment else "点赞点好了。",
-                        "summary": truncate(post.summary or "", 80),
-                        "count": len(results),
-                    },
-                }
+                if wants_comment:
+                    summary = self._comment_tool_payload(results)
+                    payload = {**summary, "tool": tool,
+                               "result": {**summary["result"], "summary": truncate(post.summary or "", 80)}}
+                else:
+                    payload = {"ok": True, "tool": tool,
+                               "result": {"message": "点赞点好了。", "summary": truncate(post.summary or "", 80),
+                                          "count": len(results)}}
                 self._log_tool_call_result({**payload, "arguments": {"user_id": user_id, "pos": pos}})
                 return await self._ask_llm_tool_reply(
                     event,
@@ -7053,13 +7204,9 @@ class QzoneStablePlugin(Star):
                         private=False,
                         like_after_comment=wants_like,
                     )
-                    payload = {
-                        "ok": True,
-                        "tool": "qzone_comment_post",
-                        "result": {"message": "评论发好了。", "count": len(results)},
-                    }
+                    payload = {**self._comment_tool_payload(results), "tool": "qzone_comment_post"}
                     self._log_tool_call_result({**payload, "arguments": {"target_uin": selection.target_uin, "selector": selector}})
-                    text = await self._ask_llm_tool_reply(event, payload, "评论发好了。")
+                    text = await self._ask_llm_tool_reply(event, payload, payload["result"]["message"])
                     return text
                 like_payloads = [await self._post_service().like_post(post) for post in posts]
                 payload = {
@@ -7231,10 +7378,11 @@ class QzoneStablePlugin(Star):
             return text
         log_payload = {"ok": True, "tool": "qzone_comment_post", "arguments": arguments, "result": results}
         self._log_tool_call_result(log_payload)
+        tool_summary = self._comment_tool_payload(results)
         text = await self._ask_llm_tool_reply(
             event,
-            {"ok": True, "tool": "qzone_comment_post", "result": {"message": "评论发好了。", "count": len(results)}},
-            "评论发好了。",
+            {**tool_summary, "tool": "qzone_comment_post"},
+            tool_summary["result"]["message"],
         )
         return text
 
