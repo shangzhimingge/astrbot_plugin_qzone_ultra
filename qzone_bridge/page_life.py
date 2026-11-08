@@ -387,6 +387,16 @@ class PageLifeJobStore:
             self._prune_locked(job.updated_at)
             return True
 
+    async def release_publish(self, job_id: str, digest: str) -> bool:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.publish_state != "sending" or job.publish_digest != digest:
+                return False
+            job.publish_state = "ready"
+            job.publish_digest = ""
+            job.updated_at = self._clock()
+            return True
+
     async def mark_unknown(self, job_id: str, *, diagnostic: dict[str, Any] | None = None) -> None:
         async with self._lock:
             job = self._jobs.get(job_id)

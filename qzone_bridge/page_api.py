@@ -355,12 +355,40 @@ class QzonePageApi:
         await self._prune_life_media()
         job_id = str(params.get("id") or "").strip()
         if job_id:
-            job = await self._life_jobs.get(job_id, account_uin)
+            try:
+                job = await self._life_jobs.get(job_id, account_uin)
+            except PageLifeError as exc:
+                if exc.code != "LIFE_EXPIRED":
+                    raise
+                job = await self._recover_life_job(job_id, account_uin)
         else:
             job = await self._life_jobs.active_or_latest(account_uin)
         data = PageLifeJobStore.public_payload(job) if job else {"state": "idle"}
         data["capability"] = self._life_capability_status()
         return _success(data)
+
+    async def _recover_life_job(self, job_id: str, account_uin: int) -> PageLifeJob:
+        if self.draft_store is None:
+            raise PageLifeError("LIFE_EXPIRED", "日常草稿任务已过期，请重新生成。")
+        drafts = await self.draft_store.list_async()
+        draft = next((item for item in drafts if item.life_job_id == str(job_id)), None)
+        if draft is None:
+            raise PageLifeError("LIFE_EXPIRED", "日常草稿任务已过期，请重新生成。")
+        if draft.life_owner_uin != int(account_uin):
+            raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，请切回原账号后查询。")
+        publish_state = {
+            "pending": "ready", "publishing": "sending", "unknown": "unknown", "published": "published",
+        }.get(draft.status, "unknown")
+        now = time.time()
+        return PageLifeJob(
+            id=draft.life_job_id, request_ids=set(), account_uin=draft.life_owner_uin,
+            state="succeeded", phase="", message="已从持久化草稿恢复发布状态。",
+            created_at=now, updated_at=now, completed_at=now, draft_id=draft.id,
+            content=draft.content, media=[], has_media=bool(draft.media), publish_state=publish_state,
+            publish_digest=draft.publish_digest,
+            publish_result=dict(draft.publish_result) if draft.publish_result else None,
+            publish_diagnostic=public_diagnostic(draft.publish_diagnostic),
+        )
 
     async def _run_life_generation(self, job_id: str, account_uin: int) -> None:
         try:
@@ -413,6 +441,7 @@ class QzonePageApi:
                 author_uin=account_uin,
                 author_name=str(current_status.get("login_nickname") or current_status.get("nickname") or "WebUI 日常草稿"),
                 group_id=0, content=result.content, media=draft_media, anonymous=False,
+                life_job_id=job_id, life_owner_uin=account_uin,
             )
             _, current_uin = await self._life_owner_status()
             if current_uin != account_uin:
@@ -1095,12 +1124,22 @@ class QzonePageApi:
         if owned_jobs and (not life_job_id or owned_jobs != {life_job_id}):
             raise PageLifeError("LIFE_PROVENANCE_REQUIRED", "日常草稿媒体需要通过原草稿载入并确认发布。")
         life_job: PageLifeJob | None = None
+        recovered_life_job = False
         digest = ""
+        draft_claim: dict[str, Any] | None = None
         should_send = True
         if life_job_id:
             if _to_int(status.get("login_uin") or status.get("uin"), 0) <= 0:
                 raise PageLifeError("LIFE_INVALID_OWNER", "请先绑定有效 QQ 账号后发布日常草稿。")
-            life_job = await self._life_jobs.get(life_job_id, _to_int(status.get("login_uin") or status.get("uin"), 0))
+            try:
+                life_job = await self._life_jobs.get(life_job_id, _to_int(status.get("login_uin") or status.get("uin"), 0))
+            except PageLifeError as exc:
+                if exc.code != "LIFE_EXPIRED":
+                    raise
+                life_job = await self._recover_life_job(
+                    life_job_id, _to_int(status.get("login_uin") or status.get("uin"), 0)
+                )
+                recovered_life_job = True
             if life_job.state != "succeeded":
                 raise PageLifeError("LIFE_NOT_READY", "日常草稿尚未生成完成。")
             for upload_id in life_upload_ids:
@@ -1116,9 +1155,35 @@ class QzonePageApi:
                 {"content": content, "media": canonical_media, "sync_weibo": sync_weibo},
                 ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
             ).encode("utf-8")).hexdigest()
-            life_job, should_send = await self._life_jobs.begin_publish(life_job_id, life_job.account_uin, digest)
-            if not should_send:
-                return _success(dict(life_job.publish_result or {}), message="说说已发布。")
+            draft_claim = await self.draft_store.claim_publish_async(
+                life_job.draft_id,
+                account_uin=life_job.account_uin,
+                content=content,
+                media=canonical_media,
+                sync_weibo=sync_weibo,
+                life_job_id=life_job.id,
+                life_owner_uin=life_job.account_uin,
+            )
+            if draft_claim.get("state") == "already_published":
+                return _success(dict(draft_claim.get("result") or {}), message="说说已发布。")
+            if draft_claim.get("state") != "acquired":
+                existing_draft = draft_claim.get("draft")
+                if getattr(existing_draft, "status", "") == "published":
+                    raise PageLifeError("LIFE_ALREADY_PUBLISHED", "该日常草稿已发布；编辑后的内容请重新生成草稿。")
+                diagnostic = public_diagnostic(getattr(existing_draft, "publish_diagnostic", None))
+                suffix = f" {diagnostic['code']} {diagnostic['id']}" if diagnostic else ""
+                code = "LIFE_UNKNOWN" if getattr(existing_draft, "status", "") in {"publishing", "unknown", "approved"} else "LIFE_NOT_READY"
+                raise PageLifeError(code, f"发布结果尚不确定，该日常草稿当前已锁定，系统不会自动重试。{suffix}")
+            digest = str(draft_claim["digest"])
+            if not recovered_life_job:
+                life_job, should_send = await self._life_jobs.begin_publish(life_job_id, life_job.account_uin, digest)
+                if not should_send:
+                    await self.draft_store.mark_unknown_async(
+                        life_job.draft_id, token=str(draft_claim["token"]),
+                        account_uin=life_job.account_uin, digest=digest,
+                        diagnostic={"code": "INTERNAL_ERROR", "phase": "bookkeeping"},
+                    )
+                    raise PageLifeError("LIFE_UNKNOWN", "持久化发布状态与任务缓存不一致，请查询空间状态。")
             media = canonical_media
         dispatched = False
         publish_phase = "controller_call"
@@ -1131,6 +1196,7 @@ class QzonePageApi:
             }
             if life_job is not None:
                 kwargs["expected_login_uin"] = life_job.account_uin
+                kwargs["retry_writes"] = False
             dispatched = True
             payload = await self.controller.publish_post(**kwargs)
             publish_phase = "result_processing"
@@ -1169,20 +1235,57 @@ class QzonePageApi:
                     "can_delete": True,
                 }
             if life_job is not None:
+                if draft_claim is None or not await self.draft_store.complete_publish_async(
+                    life_job.draft_id,
+                    token=str(draft_claim["token"]),
+                    account_uin=life_job.account_uin,
+                    digest=digest,
+                    result=data,
+                    fid=fid,
+                ):
+                    raise RuntimeError("draft publication completion was not persisted")
                 publish_phase = "bookkeeping"
-                marked = await asyncio.shield(self._life_jobs.mark_published(life_job.id, data))
+                marked = recovered_life_job or await asyncio.shield(self._life_jobs.mark_published(life_job.id, data))
                 if not marked:
                     diagnostic = _safe_diagnostic(RuntimeError(), "bookkeeping")
                     await asyncio.shield(self._life_jobs.mark_unknown(life_job.id, diagnostic=diagnostic))
             return _success(data, message="说说已发布。")
         except asyncio.CancelledError:
-            if life_job is not None and dispatched:
+            diagnostic = None
+            if draft_claim is not None and not dispatched:
+                await asyncio.shield(self.draft_store.release_publish_async(
+                    life_job.draft_id, token=str(draft_claim["token"]),
+                    account_uin=life_job.account_uin, digest=digest,
+                ))
+                if life_job is not None and not recovered_life_job:
+                    await asyncio.shield(self._life_jobs.release_publish(life_job.id, digest))
+            elif draft_claim is not None and dispatched:
                 diagnostic = _safe_diagnostic(asyncio.CancelledError(), publish_phase)
+                await asyncio.shield(self.draft_store.mark_unknown_async(
+                    life_job.draft_id, token=str(draft_claim["token"]),
+                    account_uin=life_job.account_uin, digest=digest, diagnostic=diagnostic,
+                ))
+            if life_job is not None and dispatched and not recovered_life_job:
+                diagnostic = diagnostic or _safe_diagnostic(asyncio.CancelledError(), publish_phase)
                 await asyncio.shield(self._life_jobs.mark_unknown(life_job.id, diagnostic=diagnostic))
             raise
         except Exception as error:
-            if life_job is not None and dispatched:
+            diagnostic = None
+            if draft_claim is not None and not dispatched:
+                await self.draft_store.release_publish_async(
+                    life_job.draft_id, token=str(draft_claim["token"]),
+                    account_uin=life_job.account_uin, digest=digest,
+                )
+                if life_job is not None and not recovered_life_job:
+                    await self._life_jobs.release_publish(life_job.id, digest)
+            elif draft_claim is not None and dispatched:
                 diagnostic = _safe_diagnostic(error, publish_phase)
+                await self.draft_store.mark_unknown_async(
+                    life_job.draft_id, token=str(draft_claim["token"]),
+                    account_uin=life_job.account_uin, digest=digest, diagnostic=diagnostic,
+                )
+            if life_job is not None and dispatched and not recovered_life_job:
+                diagnostic = diagnostic or _safe_diagnostic(error, publish_phase)
                 await asyncio.shield(self._life_jobs.mark_unknown(life_job.id, diagnostic=diagnostic))
                 retained = public_diagnostic(life_job.publish_diagnostic) or diagnostic
                 raise PageLifeError("LIFE_UNKNOWN",
