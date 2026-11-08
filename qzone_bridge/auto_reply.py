@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import random
+import secrets
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -85,7 +86,7 @@ class AutoReplyService:
         rng: Any = random,
     ):
         self.controller = controller
-        self.store = AtomicItemStoreFile(Path(state_path))
+        self.store = AtomicItemStoreFile(Path(state_path), strict=True)
         self.config = config
         self.generate_reply = generate_reply
         self.reply_lock = reply_lock or asyncio.Lock()
@@ -274,21 +275,57 @@ class AutoReplyService:
     def _has_bot_reply(comments: list[QzoneComment], target: QzoneComment, login: int) -> bool:
         return any(item.parent_id == target.commentid and item.uin == login for item in comments)
 
-    async def _reserve(self, login: int, key: str, today: str) -> bool:
+    async def _admit_generation(self, login: int, key: str, today: str, token: str) -> str:
+        def update(state: dict[str, Any]) -> str:
+            account = state["accounts"].setdefault(str(login), {})
+            records = account.setdefault("records", {})
+            existing = records.get(key)
+            if isinstance(existing, dict):
+                if existing.get("status") in {"baseline", "reserved", "uncertain", "complete"}:
+                    return "existing"
+                if existing.get("status") == "generating" and existing.get("day") == today:
+                    return "existing"
+            used = sum(1 for value in records.values()
+                       if isinstance(value, dict) and value.get("day") == today
+                       and value.get("status") in {"generating", "reserved", "uncertain", "complete"})
+            if used >= self.config.daily_limit:
+                return "full"
+            records[key] = {"status": "generating", "day": today, "token": token,
+                            "updated_at": int(__import__("time").time())}
+            return "acquired"
+        return str(await self._mutate_state(update))
+
+    async def _release_generation(self, login: int, key: str, token: str) -> None:
+        def update(state: dict[str, Any]) -> None:
+            account = state["accounts"].setdefault(str(login), {})
+            records = account.setdefault("records", {})
+            current = records.get(key)
+            if isinstance(current, dict) and current.get("status") == "generating" and current.get("token") == token:
+                records.pop(key, None)
+        await self._mutate_state(update)
+
+    async def _reserve(self, login: int, key: str, today: str, token: str = "") -> bool:
+        if not token:
+            token = secrets.token_urlsafe(20)
+            if await self._admit_generation(login, key, today, token) != "acquired":
+                return False
         def update(state: dict[str, Any]) -> bool:
             account = state["accounts"].setdefault(str(login), {})
             records = account.setdefault("records", {})
             existing = records.get(key)
-            if isinstance(existing, dict) and existing.get("status") in {"baseline", "reserved", "uncertain", "complete"}:
+            if (not isinstance(existing, dict) or existing.get("status") != "generating"
+                    or existing.get("token") != token):
                 return False
             used = sum(
                 1 for value in records.values()
                 if isinstance(value, dict) and value.get("day") == today
-                and value.get("status") in {"reserved", "uncertain", "complete"}
+                and value.get("status") in {"generating", "reserved", "uncertain", "complete"}
             )
-            if used >= self.config.daily_limit:
+            already_counted_for_today = existing.get("status") == "generating" and existing.get("day") == today
+            if used > self.config.daily_limit or (not already_counted_for_today and used >= self.config.daily_limit):
                 return False
-            records[key] = {"status": "reserved", "day": today, "updated_at": int(__import__("time").time())}
+            records[key] = {"status": "reserved", "day": today, "token": token,
+                            "updated_at": int(__import__("time").time())}
             return True
         return bool(await self._mutate_state(update))
 
@@ -355,16 +392,38 @@ class AutoReplyService:
                         return handled
                     if self.config.delay_max:
                         await asyncio.sleep(self.rng.uniform(self.config.delay_min, self.config.delay_max))
+                    generation_token = __import__("secrets").token_urlsafe(20)
+                    admission = await self._admit_generation(login, key, date.today().isoformat(), generation_token)
+                    if admission == "full":
+                        return handled
+                    if admission != "acquired":
+                        continue
+                    attempts += 1
                     try:
                         text = str(await self.generate_reply(post, comment) or "").strip()
                     except asyncio.CancelledError:
+                        await asyncio.shield(self._release_generation(login, key, generation_token))
                         raise
                     except Exception:
+                        await self._release_generation(login, key, generation_token)
                         continue  # LLM errors remain retryable.
                     if not text:
+                        await self._release_generation(login, key, generation_token)
                         continue
-                    async with self.reply_lock:
-                        fresh_post, fresh_comments = await self._fresh_post(entry)
+                    try:
+                        await self.reply_lock.acquire()
+                    except asyncio.CancelledError:
+                        await asyncio.shield(self._release_generation(login, key, generation_token))
+                        raise
+                    try:
+                        try:
+                            fresh_post, fresh_comments = await self._fresh_post(entry)
+                        except asyncio.CancelledError:
+                            await asyncio.shield(self._release_generation(login, key, generation_token))
+                            raise
+                        except Exception:
+                            await self._release_generation(login, key, generation_token)
+                            raise
                         fresh_target = next(
                             (item for item in fresh_comments if item.commentid == comment.commentid and item.uin == comment.uin and not item.parent_id),
                             None,
@@ -373,9 +432,11 @@ class AutoReplyService:
                             await self._finish(login, key, "complete")
                             continue
                         if key in self._manual_replied:
+                            await self._release_generation(login, key, generation_token)
                             continue
                         # A delay or slow LLM can cross the local midnight boundary.
-                        if not await self._reserve(login, key, date.today().isoformat()):
+                        if not await self._reserve(login, key, date.today().isoformat(), generation_token):
+                            await self._release_generation(login, key, generation_token)
                             continue
                         try:
                             latest_status = await asyncio.wait_for(
@@ -391,7 +452,6 @@ class AutoReplyService:
                         if not isinstance(latest_status, dict) or latest_login != login or latest_status.get("needs_rebind"):
                             await self._release_reservation(login, key)
                             return handled
-                        attempts += 1
                         try:
                             await self.controller.reply_comment(
                                 hostuin=entry.hostuin,
@@ -400,6 +460,8 @@ class AutoReplyService:
                                 comment_uin=fresh_target.uin,
                                 content=text,
                                 appid=entry.appid,
+                                expected_login_uin=login,
+                                retry_writes=False,
                             )
                         except asyncio.CancelledError:
                             await asyncio.shield(self._finish(login, key, "uncertain"))
@@ -409,4 +471,6 @@ class AutoReplyService:
                             continue
                         await self._finish(login, key, "complete")
                         handled += 1
+                    finally:
+                        self.reply_lock.release()
             return handled

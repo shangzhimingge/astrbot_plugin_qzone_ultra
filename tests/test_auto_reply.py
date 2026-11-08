@@ -198,6 +198,68 @@ def test_daily_budget_counts_reservations_and_resets_by_day(tmp_path):
     asyncio.run(scenario())
 
 
+def test_generation_admission_is_cross_instance_and_blocks_full_quota_before_llm(tmp_path):
+    async def scenario():
+        controller = Controller()
+        path = tmp_path / "shared-state.json"
+        first, second = service(controller, path), service(controller, path)
+        first.config = second.config = AutoReplyConfig(enabled=True, daily_limit=1, max_per_run=2, reply_probability=1.0)
+        admission = await asyncio.gather(
+            first._admit_generation(controller.login, "same", "2026-11-08", "TOKEN_A"),
+            second._admit_generation(controller.login, "same", "2026-11-08", "TOKEN_B"),
+        )
+        assert sorted(admission) == ["acquired", "existing"]
+        assert await second._admit_generation(controller.login, "other", "2026-11-08", "TOKEN_C") == "full"
+
+        # A full day stops repeated polls before any provider invocation.
+        controller = Controller()
+        svc = service(controller, tmp_path / "full.json")
+        svc.config = AutoReplyConfig(enabled=True, daily_limit=1, max_per_run=2, reply_probability=1.0)
+        await svc.poll_once()
+        today = auto_reply_module.date.today().isoformat()
+        def mark_full(state):
+            records = state["accounts"][str(controller.login)]["records"]
+            records['[10001,10001,"post-1","old",20001]'] = {"status": "complete", "day": today}
+        await svc._mutate_state(mark_full)
+        activation = (await svc._account_snapshot(controller.login))["activation_ts"]
+        controller.comments.extend([
+            {"commentid": f"new-{index}", "uin": 21000 + index, "nickname": "Friend", "content": "hello", "date": activation + index + 1}
+            for index in range(6)
+        ])
+        calls = 0
+        async def generator(post, comment):
+            nonlocal calls
+            calls += 1
+            return "generated"
+        svc.generate_reply = generator
+        assert await svc.poll_once() == 0
+        assert await svc.poll_once() == 0
+        assert calls == 0 and controller.sent == []
+    asyncio.run(scenario())
+
+
+def test_generation_failures_count_against_each_run_cap(tmp_path):
+    async def scenario():
+        controller = Controller()
+        svc = service(controller, tmp_path / "state.json")
+        await svc.poll_once()
+        activation = (await svc._account_snapshot(controller.login))["activation_ts"]
+        controller.comments.extend([
+            {"commentid": f"failed-{index}", "uin": 22000 + index, "nickname": "Friend", "content": "hello", "date": activation + index + 1}
+            for index in range(5)
+        ])
+        calls = 0
+        async def generator(post, comment):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("provider error")
+        svc.generate_reply = generator
+        assert await svc.poll_once() == 0 and calls == 2
+        assert await svc.poll_once() == 0 and calls == 4
+        assert controller.sent == []
+    asyncio.run(scenario())
+
+
 def test_cancelled_send_is_persisted_uncertain(tmp_path):
     async def scenario():
         controller = Controller()
@@ -357,16 +419,20 @@ def test_reservation_persistence_failure_prevents_send(tmp_path):
     asyncio.run(scenario())
 
 
-def test_corrupt_state_rebaselines_existing_comments_without_replies(tmp_path):
+def test_corrupt_state_fails_closed_without_rebaseline_or_quarantine(tmp_path):
     async def scenario():
+        from qzone_bridge.json_store import StoreReadError
+
         controller = Controller()
         path = tmp_path / "state.json"
-        path.write_text("{broken", encoding="utf-8")
+        original = b"{broken"
+        path.write_bytes(original)
         svc = service(controller, path)
-        assert await svc.poll_once() == 0
+        with pytest.raises(StoreReadError):
+            await svc.poll_once()
         assert controller.sent == []
-        assert await svc._account_snapshot(controller.login)
-        assert list(tmp_path.glob("state.json.corrupt.*"))
+        assert path.read_bytes() == original
+        assert not list(tmp_path.glob("state.json.corrupt.*"))
     asyncio.run(scenario())
 
 

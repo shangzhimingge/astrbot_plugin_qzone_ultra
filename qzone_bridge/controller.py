@@ -996,6 +996,7 @@ class QzoneDaemonController:
         media: list[dict[str, Any]] | None = None,
         content_sanitized: bool = False,
         expected_login_uin: int | None = None,
+        retry_writes: bool = True,
     ) -> dict[str, Any]:
         content = sanitize_publish_content(content, content_sanitized=content_sanitized)
         media_items = media or []
@@ -1004,6 +1005,7 @@ class QzoneDaemonController:
             "sync_weibo": sync_weibo,
             "media": media_items,
             "content_sanitized": True,
+            "retry_writes": bool(retry_writes and expected_login_uin is None),
         }
         if expected_login_uin is not None:
             request_body["expected_login_uin"] = int(expected_login_uin)
@@ -1013,7 +1015,7 @@ class QzoneDaemonController:
             json_body=request_body,
             timeout=self._publish_request_timeout(media_items),
             retry_on_timeout=False,
-            retry_on_transport_error=expected_login_uin is None,
+            retry_on_transport_error=bool(retry_writes and expected_login_uin is None),
         )
 
     async def verify_native_video_feed(
@@ -1063,6 +1065,8 @@ class QzoneDaemonController:
         comment_uin: int,
         content: str,
         appid: int = 311,
+        expected_login_uin: int | None = None,
+        retry_writes: bool = True,
     ) -> dict[str, Any]:
         return await self._request(
             "POST",
@@ -1074,7 +1078,11 @@ class QzoneDaemonController:
                 "comment_uin": comment_uin,
                 "content": content,
                 "appid": appid,
+                "retry_writes": bool(retry_writes and expected_login_uin is None),
+                **({"expected_login_uin": int(expected_login_uin)} if expected_login_uin is not None else {}),
             },
+            retry_on_timeout=bool(retry_writes and expected_login_uin is None),
+            retry_on_transport_error=bool(retry_writes and expected_login_uin is None),
         )
 
     async def delete_post(self, *, fid: str, appid: int = 311, created_at: int = 0) -> dict[str, Any]:
