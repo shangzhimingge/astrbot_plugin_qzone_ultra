@@ -245,6 +245,17 @@ class PageLifeJobStore:
                 raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，请刷新页面后重试。")
             return job
 
+    async def get_by_request(self, request_id: str, account_uin: int) -> PageLifeJob | None:
+        async with self._lock:
+            self._prune_locked(self._clock())
+            job_id = self._request_to_job.get(str(request_id or ""))
+            job = self._jobs.get(job_id or "")
+            if job is None:
+                return None
+            if job.account_uin != account_uin:
+                raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，请刷新页面后重试。")
+            return job
+
     async def set_phase(self, job_id: str, phase: str) -> bool:
         if phase not in PAGE_LIFE_PHASES:
             return False

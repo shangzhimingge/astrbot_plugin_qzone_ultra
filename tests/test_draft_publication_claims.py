@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from qzone_bridge.drafts import DraftPost, DraftStore
+from qzone_bridge.drafts import DraftPost, DraftStore, public_publish_result
 from qzone_bridge.json_store import StoreReadError
 
 
@@ -85,7 +85,7 @@ def test_separate_processes_share_one_publication_claim(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_claim_settles_worker_and_remains_blocked(tmp_path: Path, monkeypatch: Any) -> None:
+async def test_cancelled_claim_settles_worker_and_releases_only_pre_dispatch_token(tmp_path: Path, monkeypatch: Any) -> None:
     store = DraftStore(tmp_path / "drafts.json")
     draft = await store.add_async(author_uin=11, content="x")
     entered, release = threading.Event(), threading.Event()
@@ -104,8 +104,28 @@ async def test_cancelled_claim_settles_worker_and_remains_blocked(tmp_path: Path
     with pytest.raises(asyncio.CancelledError):
         await task
     monkeypatch.setattr(store._store, "transact", original)
+    assert (await store.get_async(draft.id)).status == "pending"
+    # A later explicit action can acquire a fresh token; that live claim remains
+    # blocked from a concurrent duplicate attempt.
+    retry = await store.claim_publish_async(draft.id, account_uin=99, content="x", media=[])
+    assert retry["state"] == "acquired"
+    duplicate = await store.claim_publish_async(draft.id, account_uin=99, content="x", media=[])
+    assert duplicate["state"] == "blocked"
+    assert await store.release_publish_async(
+        draft.id, token="stale-cancelled-token", account_uin=99, digest=retry["digest"]
+    ) is False
     assert (await store.get_async(draft.id)).status == "publishing"
     assert (await store.claim_publish_async(draft.id, account_uin=99, content="x", media=[]))["state"] == "blocked"
+
+
+def test_public_publish_receipt_excludes_raw_and_media_paths() -> None:
+    receipt = public_publish_result({
+        "fid": "feed-123", "message": "published", "media_count": 1, "photo_count": 1,
+        "raw": {"response": "RAW_SENTINEL"}, "post": {"images": ["C:/secret/photo.png"]},
+        "path": "C:/secret/photo.png",
+    })
+    assert receipt == {"fid": "feed-123", "media_count": 1, "photo_count": 1}
+    assert "RAW_SENTINEL" not in str(receipt) and "photo.png" not in str(receipt)
 
 
 @pytest.mark.asyncio
@@ -132,3 +152,21 @@ async def test_claim_lock_or_write_failure_never_persists_admission(tmp_path: Pa
     with pytest.raises(OSError):
         await store.claim_publish_async(draft.id, account_uin=99, content="edited", media=[])
     assert (await DraftStore(store.path).get_async(draft.id)).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_inconsistent_pending_claim_fields_are_blocked_without_rewrite(tmp_path: Path) -> None:
+    path = tmp_path / "inconsistent.json"
+    store = DraftStore(path)
+    draft = await store.add_async(author_uin=1, content="source")
+    payload = store._store.read()
+    raw = payload["items"][0]
+    raw.update({"publish_claim_token": "stale-token", "publish_account_uin": 77,
+                "publish_digest": "a" * 64, "publish_snapshot": {"content": "old"}})
+    store._store.write(payload)
+    before = path.read_bytes()
+    outcome = await store.claim_publish_async(
+        draft.id, account_uin=77, content="source", media=[]
+    )
+    assert outcome["state"] == "blocked"
+    assert path.read_bytes() == before

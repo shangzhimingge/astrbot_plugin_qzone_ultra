@@ -126,7 +126,7 @@ def test_page_frontend_reply_uses_inline_form_and_cached_detail(tmp_path: Path) 
     harness = tmp_path / "qzone_page_harness.mjs"
     app_source = (ROOT / "pages" / "qzone" / "app.js").read_text(encoding="utf-8-sig")
     instrumented_app = tmp_path / "qzone_app_instrumented.mjs"
-    instrumented_app.write_text(app_source.replace("\ninit();", "\nglobalThis.__qzoneTest = { state, el, publish, discardLifeDraftAssociation, renderLifeDraft, renderLifeDraftPreviews };\ninit();"), encoding="utf-8")
+    instrumented_app.write_text(app_source.replace("\ninit();", "\nglobalThis.__qzoneTest = { state, el, publish, discardLifeDraftAssociation, renderLifeDraft, renderLifeDraftPreviews, startLifeDraft, refreshLifeDraft, restoreLifeRecovery, clearLifePoll };\ninit();"), encoding="utf-8")
     harness.write_text(
         r'''
 import { pathToFileURL } from "node:url";
@@ -336,6 +336,13 @@ const tabs = ["friends", "self", "profile"].map((scope) => {
   return tab;
 });
 
+const sessionValues = new Map();
+globalThis.sessionStorage = {
+  getItem(key) { return sessionValues.get(key) ?? null; },
+  setItem(key, value) { sessionValues.set(key, String(value)); },
+  removeItem(key) { sessionValues.delete(key); },
+};
+
 globalThis.document = {
   activeElement: null,
   hidden: false,
@@ -366,6 +373,11 @@ let rejectComment;
 let deletePayload = null;
 let publishPayload = null;
 let lifePublishPosts = 0;
+let lifeDraftStartPosts = 0;
+let lifeDraftGetCalls = 0;
+const lifeRequests = new Map();
+let nextLifeDraftStartError = null;
+let lifeDraftGetResult = null;
 let deferLifeGet = false;
 let releaseLifeGet;
 let freshLifeGetStarted;
@@ -438,7 +450,12 @@ globalThis.window = {
         return detailPromise;
       }
       if (endpoint === "page/life-draft") {
-        if (!params.id) return Promise.resolve({ ...lifeJob });
+        lifeDraftGetCalls += 1;
+        if (params.request_id) {
+          const matched = lifeRequests.get(params.request_id);
+          return Promise.resolve(matched ? { ...matched, request_id: params.request_id } : { ...(lifeDraftGetResult || lifeJob) });
+        }
+        if (!params.id) return Promise.resolve({ ...(lifeDraftGetResult || lifeJob) });
         freshLifeGetStarted?.();
         if (deferLifeGet) return new Promise(resolve => { releaseLifeGet = resolve; });
         return Promise.resolve({ ...lifeJob });
@@ -449,6 +466,17 @@ globalThis.window = {
       throw new Error(`unexpected GET ${endpoint}`);
     },
     apiPost(endpoint, body) {
+      if (endpoint === "page/life-draft") {
+        lifeDraftStartPosts += 1;
+        if (nextLifeDraftStartError) {
+          const error = { ok: false, code: nextLifeDraftStartError.code, message: nextLifeDraftStartError.message };
+          nextLifeDraftStartError = null;
+          return Promise.reject(error);
+        }
+        const created = {id: `life-created-${lifeDraftStartPosts}`, state: "running", account_uin: 10001, request_id: body.request_id};
+        lifeRequests.set(body.request_id, created);
+        return Promise.resolve({ok: true, data: created});
+      }
       if (endpoint === "page/reply") {
         replyPayload = body;
         return Promise.resolve({
@@ -776,6 +804,46 @@ await qz.renderLifeDraftPreviews(qz.state.lifeJob);
 if (qz.state.lifeJob.preview_diagnostic_reference?.id !== "0123456789ab" || !elements.get("lifeDraftDiagnostics").textContent.includes("0123456789ab")) {
   throw new Error(`message-only preview error was not safely retained in persistent status: ${JSON.stringify({ref:qz.state.lifeJob.preview_diagnostic_reference,status:qz.state.status,owner:qz.state.lifeJob.account_uin,text:elements.get("lifeDraftDiagnostics").textContent})}`);
 }
+
+// Known pre-admission rejection clears recovery; only the next explicit click posts again.
+qz.state.lifeAssociation = null;
+qz.state.lifeAssociationInvalid = "";
+qz.state.lifeJob = { state: "idle" };
+qz.state.lifeRecovery = null;
+qz.state.lifeRequestPending = false;
+lifeDraftGetResult = { state: "idle" };
+nextLifeDraftStartError = { code: "LIFE_UNAVAILABLE", message: "fixture unavailable" };
+const startsBeforeKnown = lifeDraftStartPosts;
+await qz.startLifeDraft();
+if (lifeDraftStartPosts !== startsBeforeKnown + 1 || qz.state.lifeRecovery !== null) {
+  throw new Error("known pre-admission rejection did not clear recovery after one POST");
+}
+await qz.startLifeDraft();
+if (lifeDraftStartPosts !== startsBeforeKnown + 2 || qz.state.lifeJob?.id !== `life-created-${startsBeforeKnown + 2}`) {
+  throw new Error("explicit second click did not create exactly one new Life request");
+}
+
+// Ambiguous response stores recovery. Click and restored-session reload perform GET only.
+qz.state.lifeJob = { state: "idle" };
+qz.state.lifeRecovery = null;
+qz.state.lifeRequestPending = false;
+nextLifeDraftStartError = { code: "PAGE_ERROR", message: "fixture response lost" };
+const startsBeforeUnknown = lifeDraftStartPosts;
+const getsBeforeUnknown = lifeDraftGetCalls;
+await qz.startLifeDraft();
+if (lifeDraftStartPosts !== startsBeforeUnknown + 1 || !qz.state.lifeRecovery) {
+  throw new Error(`ambiguous response did not preserve recovery: ${JSON.stringify({posts: lifeDraftStartPosts - startsBeforeUnknown, recovery:qz.state.lifeRecovery, gets:lifeDraftGetCalls - getsBeforeUnknown})}`);
+}
+const recoveredValue = sessionValues.values().next().value;
+if (!recoveredValue) throw new Error("ambiguous request recovery was not persisted to session storage");
+qz.state.lifeRecovery = null; // Simulate a page reload before restoring its persisted token.
+qz.restoreLifeRecovery();
+if (!qz.state.lifeRecovery) throw new Error("page reload did not restore the pending request token");
+await qz.startLifeDraft();
+if (lifeDraftStartPosts !== startsBeforeUnknown + 1 || lifeDraftGetCalls < getsBeforeUnknown + 2) {
+  throw new Error("recovery click/reload must query only and never send another POST");
+}
+qz.clearLifePoll();
 ''',
         encoding="utf-8",
     )

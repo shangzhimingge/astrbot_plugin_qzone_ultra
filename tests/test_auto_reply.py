@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -191,7 +193,9 @@ def test_daily_budget_counts_reservations_and_resets_by_day(tmp_path):
         svc = service(Controller(), tmp_path / "state.json")
         svc.config = AutoReplyConfig(enabled=True, daily_limit=1)
         assert await svc._reserve(10001, "one", "2026-11-04")
-        await svc._finish(10001, "one", "complete")
+        state = await svc._state()
+        token = state["accounts"]["10001"]["records"]["one"]["token"]
+        await svc._finish(10001, "one", "complete", token)
         await svc.mark_manual_reply(10001, 10001, "post-1", "one", 20001)
         assert not await svc._reserve(10001, "two", "2026-11-04")
         assert await svc._reserve(10001, "two", "2026-11-05")
@@ -537,7 +541,9 @@ def test_manual_marker_preserves_auto_daily_budget_and_survives_restart(tmp_path
         entries = await svc._fetch_entries(controller.login)
         key = svc._identity(controller.login, entries[0], QzoneComment("manual", 20002))
         assert await svc._reserve(controller.login, key, today)
-        await svc._finish(controller.login, key, "complete")
+        state = await svc._state()
+        token = state["accounts"][str(controller.login)]["records"][key]["token"]
+        await svc._finish(controller.login, key, "complete", token)
         await svc.mark_manual_reply(controller.login, controller.login, "post-1", "manual", 20002)
         state = await svc._state()
         marker = state["accounts"][str(controller.login)]["records"][key]
@@ -562,7 +568,9 @@ def test_reservation_after_midnight_delay_uses_new_local_day(tmp_path, monkeypat
         activation = (await svc._account_snapshot(controller.login))["activation_ts"]
         controller.comments.append({"commentid": "midnight", "uin": 20002, "nickname": "Friend", "content": "hello", "date": activation + 1})
         assert await svc._reserve(controller.login, "prior-day", "2026-11-04")
-        await svc._finish(controller.login, "prior-day", "complete")
+        prior_state = await svc._state()
+        prior_token = prior_state["accounts"][str(controller.login)]["records"]["prior-day"]["token"]
+        await svc._finish(controller.login, "prior-day", "complete", prior_token)
         svc.config = AutoReplyConfig(enabled=True, poll_interval=30, delay_min=1, delay_max=1, daily_limit=1, reply_probability=1)
         current = {"day": "2026-11-04"}
         class FakeDate:
@@ -581,4 +589,94 @@ def test_reservation_after_midnight_delay_uses_new_local_day(tmp_path, monkeypat
         state = await svc._state()
         record = next(value for key, value in state["accounts"][str(controller.login)]["records"].items() if '"midnight"' in key)
         assert record["day"] == "2026-11-05"
+    asyncio.run(scenario())
+
+
+@pytest.mark.asyncio
+async def test_malformed_nested_state_fails_closed_and_preserves_json_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "auto-reply.json"
+    original = b'{"next_id":1,"items":[{"key":"qzone-auto-reply-state-v1","state":{"accounts":[]}}]}'
+    path.write_bytes(original)
+    target = service(Controller(), path)
+    with pytest.raises(ValueError):
+        await target._admit_generation(10001, "comment", "2026-11-09", "token")
+    assert path.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_record_blocks_generation_and_stale_finish_after_manual(tmp_path: Path) -> None:
+    path = tmp_path / "auto-reply.json"
+    target = service(Controller(), path)
+    await target._mutate_state(lambda state: state["accounts"].update({
+        "10001": {"initialized": True, "records": {"comment": {"mystery": True}}}
+    }))
+    assert await target._admit_generation(10001, "comment", "2026-11-09", "token") == "existing"
+    await target._mutate_state(lambda state: state["accounts"]["10001"]["records"].update({
+        "comment": {"status": "generating", "day": "2026-11-09", "token": "stale"}
+    }))
+    assert await target.mark_manual_reply(10001, 10001, "post", "cid", 20001)
+    assert not await target._finish(10001, '[10001,10001,"post","cid",20001]', "uncertain", "stale")
+
+
+def test_prior_day_crash_left_generation_marker_is_reclaimed(tmp_path: Path) -> None:
+    async def scenario():
+        controller = Controller()
+        svc = service(controller, tmp_path / "stale-generation.json")
+        assert await svc.poll_once() == 0
+        state = await svc._state()
+        activation = state["accounts"][str(controller.login)]["activation_ts"]
+        controller.comments.append({"commentid": "crash-left", "uin": 20004, "nickname": "Friend", "content": "hello", "date": activation + 10})
+        entries = await svc._fetch_entries(controller.login)
+        _post, parsed = await svc._fresh_post(entries[0])
+        key = svc._identity(controller.login, entries[0], parsed[-1])
+        today = auto_reply_module.date.today().isoformat()
+        stale_day = "2000-01-01" if today != "2000-01-01" else "1999-01-01"
+        await svc._mutate_state(lambda current: current["accounts"][str(controller.login)]["records"].__setitem__(
+            key, {"status": "generating", "day": stale_day, "token": "STALE", "updated_at": 1}
+        ))
+        assert await svc.poll_once() == 1
+        assert controller.sent[-1]["commentid"] == "crash-left"
+    asyncio.run(scenario())
+
+
+def test_cancelled_threaded_generation_admission_releases_committed_token(tmp_path: Path, monkeypatch: Any) -> None:
+    async def scenario():
+        svc = service(Controller(), tmp_path / "cancel-admit.json")
+        entered, release = threading.Event(), threading.Event()
+        original = svc.store.transact
+        def slow(updater: Any) -> Any:
+            entered.set()
+            assert release.wait(10)
+            return original(updater)
+        monkeypatch.setattr(svc.store, "transact", slow)
+        task = asyncio.create_task(svc._admit_generation(10001, "key", "2026-11-19", "token-admit"))
+        assert await asyncio.to_thread(entered.wait, 10)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        monkeypatch.setattr(svc.store, "transact", original)
+        assert (await svc._state())["accounts"]["10001"]["records"] == {}
+    asyncio.run(scenario())
+
+
+def test_cancelled_threaded_reservation_releases_committed_token(tmp_path: Path, monkeypatch: Any) -> None:
+    async def scenario():
+        svc = service(Controller(), tmp_path / "cancel-reserve.json")
+        assert await svc._admit_generation(10001, "key", "2026-11-19", "token-reserve") == "acquired"
+        entered, release = threading.Event(), threading.Event()
+        original = svc.store.transact
+        def slow(updater: Any) -> Any:
+            entered.set()
+            assert release.wait(10)
+            return original(updater)
+        monkeypatch.setattr(svc.store, "transact", slow)
+        task = asyncio.create_task(svc._reserve(10001, "key", "2026-11-19", "token-reserve"))
+        assert await asyncio.to_thread(entered.wait, 10)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        monkeypatch.setattr(svc.store, "transact", original)
+        assert (await svc._state())["accounts"]["10001"]["records"] == {}
     asyncio.run(scenario())

@@ -299,8 +299,9 @@ class QzoneClient:
             code = int(raw_code or 0)
         except (TypeError, ValueError):
             code = 0
-        message = str(detail.get("message") or detail.get("msg") or exc)
-        return code == -10005 or "未输入内容" in message
+        # Only the structured validation code proves the server rejected this
+        # request before creating/updating a post; message text is not enough.
+        return code == -10005
 
     def _raise_payload_error(self, payload: Any, response: httpx.Response) -> None:
         if not isinstance(payload, dict):
@@ -1380,7 +1381,11 @@ class QzoneClient:
             )
             errors = [result for result in results if isinstance(result, Exception)]
             if errors:
-                if not all(isinstance(error, QzoneRequestError) for error in errors):
+                policy = _RETRY_WRITES.get()
+                protected_scope = bool(policy and policy[0] == id(self) and not policy[1])
+                if protected_scope or not all(isinstance(error, QzoneRequestError) for error in errors):
+                    # In a protected single-attempt publication, an upload error
+                    # may follow an accepted write with a lost response.
                     raise errors[0]
                 log.debug("parallel qzone image upload failed; retrying failed items sequentially", exc_info=errors[0])
                 for (index, photo), result in zip(pending, results):

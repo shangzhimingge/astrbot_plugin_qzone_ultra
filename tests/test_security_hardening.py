@@ -181,6 +181,7 @@ def test_life_pipeline_shares_six_provider_calls_across_prompt_and_caption(monke
         life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
         life_publish_failure_policy="skip", life_publish_mode="draft",
         life_publish_static_caption="static", life_publish_image_retry_count=0,
+        admin_uins=[10001], manage_group=0, persona_id="",
     )
     plugin._life_budget_snapshot = lambda _settings: (5.0, 2.0, 2.0)
     class Provider:
@@ -189,7 +190,13 @@ def test_life_pipeline_shares_six_provider_calls_across_prompt_and_caption(monke
             self.calls.append(prompt)
             return "approved"
     provider = Provider()
-    plugin.llm = main.QzoneLLM(object(), plugin.settings)
+    class Context:
+        persona_manager = None
+        def get_using_provider(self, *args, **kwargs): return provider
+        def get_current_chat_provider_id(self, *args, **kwargs): return "fixture-provider"
+        def get_provider_by_id(self, _provider_id): return provider
+    plugin._context = Context()
+    plugin.llm = main.QzoneLLM(plugin._context, plugin.settings)
     async def get_context(): return {"fixture": True}, "context"
     async def prompt(event, *_args, **_kwargs):
         set_snapshot({"persona_prompt": "fixture", "provider_id": "", "provider": provider,
@@ -234,8 +241,8 @@ def test_life_image_timeout_is_terminal_even_with_text_only_policy(monkeypatch):
     plugin = object.__new__(main.QzoneStablePlugin)
     plugin.settings = types.SimpleNamespace(
         life_publish_timezone="UTC", life_publish_image_style_prompt="",
-        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
-        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=False,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=False,
         life_publish_failure_policy="text_only", life_publish_mode="draft",
         life_publish_image_retry_count=2, life_publish_static_caption="must-not-fallback",
         life_publish_generation_timeout_seconds=300, life_publish_image_timeout_seconds=180,
@@ -290,8 +297,8 @@ def test_life_pipeline_propagates_external_cancel_swallowed_by_image_dependency(
     plugin = object.__new__(main.QzoneStablePlugin)
     plugin.settings = types.SimpleNamespace(
         life_publish_timezone="UTC", life_publish_image_style_prompt="",
-        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
-        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=False,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=False,
         life_publish_failure_policy="text_only", life_publish_mode="draft",
         life_publish_static_caption="forbidden", life_publish_image_retry_count=0,
     )
@@ -382,8 +389,8 @@ def test_life_stage_and_total_deadlines_fail_closed(monkeypatch, stall_stage, bu
     plugin = object.__new__(main.QzoneStablePlugin)
     plugin.settings = types.SimpleNamespace(
         life_publish_timezone="UTC", life_publish_image_style_prompt="",
-        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
-        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=False,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=False,
         life_publish_failure_policy="text_only", life_publish_mode="draft",
         life_publish_static_caption="forbidden-fallback", life_publish_image_retry_count=2,
     )
@@ -455,8 +462,8 @@ def test_total_deadline_during_caption_sync_provider_is_reported_as_caption(monk
     plugin = object.__new__(main.QzoneStablePlugin)
     plugin.settings = types.SimpleNamespace(
         life_publish_timezone="UTC", life_publish_image_style_prompt="",
-        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=True,
-        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=True,
+        life_publish_use_life_context=True, life_publish_use_llm_image_prompt=False,
+        life_publish_use_omnidraw_selfie=True, life_publish_auto_caption=False,
         life_publish_failure_policy="text_only", life_publish_mode="draft",
         life_publish_static_caption="forbidden", life_publish_image_retry_count=0,
     )
@@ -722,17 +729,38 @@ def test_bridge_api_version_matches_plugin_metadata_and_main_requirement(monkeyp
 
     main = _import_main_with_stubs(monkeypatch)
     metadata = Path("metadata.yaml").read_text(encoding="utf-8")
-    assert qzone_bridge.__version__ == "0.9.8"
-    assert "version: 0.9.8" in metadata
-    assert qzone_bridge.BRIDGE_API_VERSION == 2026110701
+    assert qzone_bridge.__version__ == "0.9.9"
+    assert "version: 0.9.9" in metadata
+    assert qzone_bridge.BRIDGE_API_VERSION == 2026110801
     assert main.REQUIRED_QZONE_BRIDGE_API_VERSION == qzone_bridge.BRIDGE_API_VERSION
 
 
-@pytest.mark.parametrize("attribute", ["capture_life_inputs", "project_life_context", "unknown_life_context"])
+@pytest.mark.parametrize("attribute", ["capture_life_inputs", "project_life_context", "unknown_life_context", "LifeDepictionSnapshot"])
 def test_bridge_cache_contract_rejects_missing_life_context_helper(monkeypatch: pytest.MonkeyPatch, attribute: str) -> None:
     main = _import_main_with_stubs(monkeypatch)
     module = sys.modules["qzone_bridge.life_context"]
     monkeypatch.setattr(module, attribute, None)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+@pytest.mark.parametrize(("module_name", "class_name", "method_name"), [
+    ("qzone_bridge.drafts", "DraftStore", "snapshot_publish_async"),
+    ("qzone_bridge.page_life", "PageLifeJobStore", "release_publish"),
+    ("qzone_bridge.client", "QzoneClient", "write_retry_policy"),
+])
+def test_hot_reload_contract_rejects_missing_new_runtime_methods(
+    monkeypatch: pytest.MonkeyPatch, module_name: str, class_name: str, method_name: str
+) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    cls = getattr(sys.modules[module_name], class_name)
+    monkeypatch.delattr(cls, method_name)
+    assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
+
+
+def test_hot_reload_contract_requires_frozen_life_depiction_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    main = _import_main_with_stubs(monkeypatch)
+    cls = sys.modules["qzone_bridge.life_context"].LifeDepictionSnapshot
+    monkeypatch.delattr(cls, "prompt_context")
     assert not main._qzone_bridge_contract_is_current(main._local_qzone_bridge_root())
 
 
@@ -5699,6 +5727,8 @@ def test_plugin_publish_sends_native_video_to_daemon_without_client_handoff(
         "sync_weibo": False,
         "media": [original.media[0].to_dict()],
         "content_sanitized": True,
+        "expected_login_uin": None,
+        "retry_writes": True,
     }
 
 
@@ -5778,6 +5808,8 @@ def test_plugin_publish_uses_daemon_h5_even_when_onebot_protocol_native_video_av
         "sync_weibo": False,
         "media": [original.media[0].to_dict()],
         "content_sanitized": True,
+        "expected_login_uin": None,
+        "retry_writes": True,
     }
 
 
@@ -5854,6 +5886,8 @@ def test_plugin_publish_prefers_ready_daemon_h5_over_broken_onebot_action(
         "sync_weibo": False,
         "media": [original.media[0].to_dict()],
         "content_sanitized": True,
+        "expected_login_uin": None,
+        "retry_writes": True,
     }
 
 
@@ -5912,6 +5946,8 @@ def test_plugin_publish_routes_mixed_video_media_to_daemon_instead_of_cover_fall
         "sync_weibo": False,
         "media": [video.to_dict(), image.to_dict()],
         "content_sanitized": True,
+        "expected_login_uin": None,
+        "retry_writes": True,
     }
 
 
@@ -8522,6 +8558,10 @@ def test_auto_publish_once_uses_life_scheduler_and_omnidraw_selfie_return_result
             self.life = _LifePlugin()
             self.omnidraw = _OmniDrawPlugin()
 
+        def get_current_chat_provider_id(self, *args, **kwargs): return "fixture-provider"
+        def get_provider_by_id(self, _provider_id): return types.SimpleNamespace(text_chat=lambda **kwargs: "")
+        def get_using_provider(self, *args, **kwargs): return self.get_provider_by_id("fixture-provider")
+
         def get_registered_star(self, name):
             if name == "astrbot_plugin_life_scheduler":
                 return _Metadata(self.life)
@@ -8530,6 +8570,9 @@ def test_auto_publish_once_uses_life_scheduler_and_omnidraw_selfie_return_result
             return None
 
     class _Controller:
+        async def get_status(self, *, probe_daemon=False):
+            return {"login_uin": 123456}
+
         async def publish_post(self, **kwargs):
             captured["publish"] = kwargs
             return {"fid": "fid-life", "photo_count": len(kwargs.get("media") or [])}
@@ -8562,6 +8605,7 @@ def test_auto_publish_once_uses_life_scheduler_and_omnidraw_selfie_return_result
     )
     plugin.data_dir = tmp_path
     plugin._context = _Context()
+    plugin.llm = main.QzoneLLM(plugin._context, plugin.settings)
     plugin.controller = _Controller()
     plugin._onebot_client = None
     plugin._ensure_cookie_ready = fake_ready
@@ -8596,7 +8640,7 @@ def test_auto_life_publish_accepts_manual_event_and_force_publishes(
     captured: dict[str, object] = {"publish": None, "selfie_calls": []}
 
     class _Event:
-        unified_msg_origin = "aiocqhttp:group:654"
+        unified_msg_origin = "aiocqhttp:GroupMessage:654"
         message_str = "发日常说说"
 
         def get_sender_id(self):
@@ -8629,6 +8673,10 @@ def test_auto_life_publish_accepts_manual_event_and_force_publishes(
             self.life = _LifePlugin()
             self.omnidraw = _OmniDrawPlugin()
 
+        def get_current_chat_provider_id(self, *args, **kwargs): return "fixture-provider"
+        def get_provider_by_id(self, _provider_id): return types.SimpleNamespace(text_chat=lambda **kwargs: "")
+        def get_using_provider(self, *args, **kwargs): return self.get_provider_by_id("fixture-provider")
+
         def get_registered_star(self, name):
             if name == "astrbot_plugin_life_scheduler":
                 return _Metadata(self.life)
@@ -8637,6 +8685,9 @@ def test_auto_life_publish_accepts_manual_event_and_force_publishes(
             return None
 
     class _Controller:
+        async def get_status(self, *, probe_daemon=False):
+            return {"login_uin": 987654}
+
         async def publish_post(self, **kwargs):
             captured["publish"] = kwargs
             return {"fid": "fid-life-manual"}
@@ -8671,6 +8722,7 @@ def test_auto_life_publish_accepts_manual_event_and_force_publishes(
     )
     plugin.data_dir = tmp_path
     plugin._context = _Context()
+    plugin.llm = main.QzoneLLM(plugin._context, plugin.settings)
     plugin.controller = _Controller()
     plugin._onebot_client = None
     plugin._ensure_cookie_ready = fake_ready
@@ -8965,20 +9017,22 @@ def test_life_operation_freezes_clock_style_and_projection_before_scheduler_awai
     plugin.settings = PluginSettings.from_mapping({"life_publish": {"enabled": True, "image_style_prompt": "FROZEN_STYLE"}})
     plugin._context = Context()
     plugin.data_dir = tmp_path
+    plugin._llm_adapter = lambda: types.SimpleNamespace(prepare_persona_snapshot=lambda *args, **kwargs: asyncio.sleep(0))
 
-    async def image_prompt(event, life_context, *, projection, style_prompt):
+    async def image_prompt(event, life_context, *, projection, style_prompt, depiction=None, **kwargs):
         captured["image_projection"] = projection
         captured["style"] = style_prompt
         captured["image_context"] = life_context
         return main.QzoneStablePlugin._assemble_life_image_prompt(
             "自拍构图", "", temporal_context=projection.image_context(),
             style_prompt=style_prompt, current_plan_supported=projection.current_plan is not None,
+            depiction_context=depiction.prompt_context() if depiction else "",
         )
 
-    async def media(event, prompt):
+    async def media(event, prompt, **kwargs):
         return [main.PostMedia(kind="image", source="fixture.png", trusted_local=True)], {"success": True}
 
-    async def caption(event, *, life_context, image_prompt, projection):
+    async def caption(event, *, life_context, image_prompt, projection, depiction=None, **kwargs):
         captured["caption_projection"] = projection
         captured["caption_context"] = life_context
         captured["image_action"] = image_prompt
@@ -9069,7 +9123,7 @@ def test_custom_life_templates_without_placeholders_receive_same_temporal_facts(
     assert stamp in captured["image_prompt"] and "来源日期：2026-11-05（本地当天）" in captured["image_prompt"]
     assert "FROZEN_STYLE" in captured["image_prompt"]
     assert stamp in captured["caption_prompt"] and projection.caption_time_rules() in captured["caption_prompt"]
-    assert stamp in captured["task_context"] and projection.caption_time_rules() in captured["task_context"]
+    assert projection.caption_time_rules() in captured["task_context"]
     assert stamp in captured["authoritative_facts"] and projection.caption_time_rules() in captured["authoritative_facts"]
 
 
@@ -9114,7 +9168,7 @@ def test_real_persona_guard_life_caption_failure_never_publishes_or_falls_back(
     plugin.data_dir = tmp_path
     plugin.controller = type("Controller", (), {"publish_post": lambda self, **kwargs: pytest.fail("must not publish")})()
 
-    async def selfie(event, prompt):
+    async def selfie(event, prompt, settings_snapshot=None):
         return [object()], {"success": True, "images": []}
     plugin._generate_life_selfie_media = selfie
     from qzone_bridge.errors import LifeGenerationError
@@ -9170,6 +9224,59 @@ def test_life_projection_failure_text_only_uses_separately_approved_caption(monk
     assert captured[0][0].content == "approved caption"
     assert captured[0][0].media == []
     assert len(provider.calls) == 3  # invalid projection, caption, approval review
+
+
+@pytest.mark.parametrize("failure_policy", ["skip", "text_only"])
+def test_no_provider_image_snapshot_uses_existing_image_failure_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_policy: str
+) -> None:
+    from qzone_bridge.llm import QzoneLLM
+
+    main = _import_main_with_stubs(monkeypatch)
+    settings = PluginSettings.from_mapping({
+        "llm": {"persona_id": "p"},
+        "life_publish": {
+            "enabled": True, "mode": "draft", "failure_policy": failure_policy,
+            "use_life_context": False, "use_llm_image_prompt": True,
+            "inherit_persona_visual": False, "auto_caption": False,
+            "static_caption": "APPROVED_STATIC_CAPTION",
+        },
+    })
+    class Manager:
+        async def resolve_selected_persona(self, **kwargs):
+            return "p", {"prompt": "fixture persona"}, None, False
+        async def get_persona_v3_by_id(self, _pid): return {"prompt": "fixture persona"}
+    class Context:
+        persona_manager = Manager()
+        conversation_manager = None
+        platform_manager = None
+        async def get_config(self, umo): return {"provider_settings": {}}
+        async def get_using_provider(self, **kwargs): return None
+    context = Context()
+    plugin = object.__new__(main.QzoneStablePlugin)
+    plugin.settings = settings
+    plugin._context = context
+    plugin.llm = QzoneLLM(context, settings)
+    plugin.data_dir = tmp_path
+    plugin._life_budget_snapshot = lambda _settings: (2.0, 1.0, 1.0)
+    plugin._omnidraw_plugin = lambda: None
+    plugin._scheduled_plugin_event = lambda **_kwargs: types.SimpleNamespace(
+        _qzone_context_free=True, unified_msg_origin=None, message_str=""
+    )
+    async def empty_context(): return {}, ""
+    plugin._get_life_context = empty_context
+    stored = []
+    async def store(post, **kwargs):
+        stored.append(post)
+        return {"draft": True}
+    plugin._publish_or_draft_scheduled_post = store
+
+    result = asyncio.run(plugin._auto_life_publish_once())
+    if failure_policy == "skip":
+        assert result is None and stored == []
+    else:
+        assert result == {"draft": True} and len(stored) == 1
+        assert stored[0].content == "APPROVED_STATIC_CAPTION" and stored[0].media == []
 
 
 def test_real_life_guard_publishes_approved_caption_with_validated_visual_reference(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -9307,6 +9414,9 @@ def test_life_selfie_media_prefers_generate_selfie_return_result_method(
             if name == "astrbot_plugin_omnidraw":
                 return _Metadata(_OmniDrawPlugin())
             return None
+        def get_current_chat_provider_id(self, *args, **kwargs): return "fixture-provider"
+        def get_provider_by_id(self, _provider_id): return types.SimpleNamespace(text_chat=lambda **kwargs: "")
+        def get_using_provider(self, *args, **kwargs): return self.get_provider_by_id("fixture-provider")
 
     plugin = object.__new__(main.QzoneStablePlugin)
     plugin.settings = PluginSettings.from_mapping(
@@ -9500,6 +9610,10 @@ def test_auto_life_publish_skip_policy_does_not_publish_when_omnidraw_missing(
                 return _Metadata(_LifePlugin())
             return None
 
+        def get_current_chat_provider_id(self, *args, **kwargs): return "fixture-provider"
+        def get_provider_by_id(self, _provider_id): return types.SimpleNamespace(text_chat=lambda **kwargs: "")
+        def get_using_provider(self, *args, **kwargs): return self.get_provider_by_id("fixture-provider")
+
     class _Controller:
         async def publish_post(self, **kwargs):
             captured["published"] = True
@@ -9515,6 +9629,7 @@ def test_auto_life_publish_skip_policy_does_not_publish_when_omnidraw_missing(
     plugin.settings = PluginSettings.from_mapping({"life_publish": {"enabled": True}})
     plugin.data_dir = tmp_path
     plugin._context = _Context()
+    plugin.llm = main.QzoneLLM(plugin._context, plugin.settings)
     plugin.controller = _Controller()
     plugin._onebot_client = None
     plugin._ensure_cookie_ready = fake_ready
@@ -9539,6 +9654,7 @@ def test_auto_life_publish_text_only_policy_creates_draft_without_image(
                 "mode": "draft",
                 "failure_policy": "text_only",
                 "auto_caption": False,
+                "use_llm_image_prompt": False,
                 "static_caption": "今天只写文字。",
             }
         }
@@ -9546,11 +9662,12 @@ def test_auto_life_publish_text_only_policy_creates_draft_without_image(
     plugin.data_dir = tmp_path
     plugin.drafts = main.DraftStore(tmp_path / "drafts.json")
     plugin._context = types.SimpleNamespace(get_registered_star=lambda name: None)
+    plugin.llm = main.QzoneLLM(plugin._context, plugin.settings)
     plugin._onebot_client = None
     plugin._capture_onebot_client = lambda event=None: None
     plugin._render_markdown_image = lambda *args, **kwargs: None
 
-    async def fake_prompt(event, life_context):
+    async def fake_prompt(event, life_context, **kwargs):
         return "无法生图但有提示词"
 
     plugin._generate_life_image_prompt = fake_prompt

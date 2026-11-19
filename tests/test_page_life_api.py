@@ -169,12 +169,56 @@ def test_life_publish_requires_provenance_and_never_sends_twice(tmp_path):
         second = await api.publish({"content": "daily", "life_job_id": job.id})
         assert len(controller.published) == 2
         assert controller.published[1]["expected_login_uin"] == 123
-        assert first == second
+        assert first["data"]["fid"] == second["data"]["fid"] == "f1"
+        assert first["data"]["media_count"] == second["data"]["media_count"] == 0
+        assert first["data"]["photo_count"] == second["data"]["photo_count"] == 0
+        assert first["data"]["post"]["id"] and "post" not in second["data"]
         with pytest.raises(PageLifeError):
             await api.publish({"content": "edited", "life_job_id": job.id})
         assert len(controller.published) == 2
         await api.close()
 
+    asyncio.run(scenario())
+
+
+def test_life_publish_empty_success_response_is_unknown_not_published(tmp_path):
+    async def scenario():
+        controller = Controller()
+        async def empty_success(**kwargs):
+            controller.published.append(kwargs)
+            return {}
+        controller.publish_post = empty_success
+        async def generate(_progress):
+            return PostPayload("daily", [])
+        api = _api(tmp_path, controller, generate)
+        started = await api.start_life_draft({"action": "generate_draft", "request_id": "empty-receipt"})
+        job = await api._life_jobs.get(started["data"]["id"], 123)
+        await job.task
+        with pytest.raises(PageLifeError) as caught:
+            await api.publish({"content": "daily", "life_job_id": job.id})
+        assert caught.value.code == "LIFE_UNKNOWN"
+        assert (await api.draft_store.get_async(job.draft_id)).status == "unknown"
+        assert (await api._life_jobs.get(job.id, 123)).publish_state == "unknown"
+        with pytest.raises(PageLifeError):
+            await api.publish({"content": "daily", "life_job_id": job.id})
+        assert len(controller.published) == 1
+        await api.close()
+    asyncio.run(scenario())
+
+
+def test_life_recovery_query_correlates_exact_request_id(tmp_path):
+    async def scenario():
+        async def generate(_progress):
+            return PostPayload("daily", [])
+        api = _api(tmp_path, Controller(), generate)
+        started = await api.start_life_draft({"action": "generate_draft", "request_id": "request-A"})
+        job = await api._life_jobs.get(started["data"]["id"], 123)
+        await job.task
+        matched = await api.get_life_draft({"request_id": "request-A"})
+        unrelated = await api.get_life_draft({"request_id": "request-B"})
+        assert matched["data"]["id"] == job.id and matched["data"]["request_id"] == "request-A"
+        assert unrelated["data"] == {"state": "idle", "capability": unrelated["data"]["capability"]}
+        await api.close()
     asyncio.run(scenario())
 
 

@@ -19,6 +19,21 @@ DraftStatus = Literal["pending", "approved", "rejected", "recalled", "published"
 _PROTECTED_STATES = {"approved", "published", "publishing", "unknown"}
 
 
+def public_publish_result(value: Any) -> dict[str, Any]:
+    """Keep durable/idempotent publish receipts to non-sensitive scalar fields."""
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("fid", "media_count", "photo_count"):
+        item = value.get(key)
+        if key in {"media_count", "photo_count"}:
+            if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+                result[key] = item
+        elif isinstance(item, str) and item:
+            result[key] = item[:160]
+    return result
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -56,6 +71,13 @@ class DraftPost:
         allowed = {"pending", "approved", "rejected", "recalled", "published", "publishing", "unknown"}
         if status not in allowed:
             # Preserve an unrecognized state as unknown rather than authorizing a send.
+            status = "unknown"
+        protected_fields = (
+            "publish_claim_token", "publish_account_uin", "publish_digest",
+            "publish_snapshot", "publish_claimed_at", "publish_result", "publish_diagnostic",
+        )
+        if status == "pending" and any(data.get(field) not in (None, "", 0, {}) for field in protected_fields):
+            # A contradictory pending+claim record is never re-authorized as a fresh send.
             status = "unknown"
         return cls(
             id=int(data.get("id") or 0),
@@ -370,10 +392,22 @@ class DraftStore:
                 draft.publish_snapshot = snapshot
                 draft.publish_claimed_at = now_iso()
                 draft.updated_at = draft.publish_claimed_at
-                raw.clear(); raw.update(draft.to_dict())
+                raw.clear()
+                raw.update(draft.to_dict())
                 return {"state": "acquired", "draft": draft, "token": token, "digest": digest, "snapshot": snapshot}
             return {"state": "missing"}
-        return await self._transaction_uncancellable(claim)
+        task = asyncio.create_task(self._store.transact_async(claim))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                result = await asyncio.shield(task)
+                if isinstance(result, dict) and result.get("state") == "acquired":
+                    await asyncio.shield(self.release_publish_async(
+                        draft_id, token=token, account_uin=account_uin, digest=digest,
+                    ))
+            finally:
+                raise
 
     async def complete_publish_async(self, draft_id: int, *, token: str, account_uin: int, digest: str,
                                      result: dict[str, Any], fid: str = "") -> bool:
@@ -388,7 +422,8 @@ class DraftStore:
                     draft.published_fid = str(fid or result.get("fid") or "")
                     draft.publish_result = dict(result)
                     draft.updated_at = now_iso()
-                    raw.clear(); raw.update(draft.to_dict())
+                    raw.clear()
+                    raw.update(draft.to_dict())
                     return True
             return False
         return await self._transaction_uncancellable(complete)
@@ -409,7 +444,8 @@ class DraftStore:
                     draft.publish_digest = digest
                     draft.publish_snapshot = snapshot
                     draft.updated_at = now_iso()
-                    raw.clear(); raw.update(draft.to_dict())
+                    raw.clear()
+                    raw.update(draft.to_dict())
                     return digest
             return None
         return await self._transaction_uncancellable(update)
@@ -429,7 +465,8 @@ class DraftStore:
                     draft.publish_claimed_at = ""
                     draft.publish_account_uin = 0
                     draft.updated_at = now_iso()
-                    raw.clear(); raw.update(draft.to_dict())
+                    raw.clear()
+                    raw.update(draft.to_dict())
                     return True
             return False
         return await self._transaction_uncancellable(release)
@@ -467,7 +504,8 @@ class DraftStore:
                     draft.status = "unknown"
                     draft.publish_diagnostic = safe_diagnostic
                     draft.updated_at = now_iso()
-                    raw.clear(); raw.update(draft.to_dict())
+                    raw.clear()
+                    raw.update(draft.to_dict())
                     return True
             return False
         return await self._transaction_uncancellable(mark)

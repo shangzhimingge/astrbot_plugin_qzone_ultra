@@ -441,31 +441,46 @@ class QzoneLLM:
         return snapshot
 
     async def generate_persona_visual_projection(
-        self, event: Any, *, provider_id: str = "", allow_automatic: bool = True
+        self, event: Any, *, provider_id: str = "", allow_automatic: bool = True,
+        inherit_persona_visual: bool | None = None, persona_visual_prompt: str | None = None,
     ) -> str:
         if current_scope() is None:
             async with generation_scope():
                 return await self._generate_persona_visual_projection_scoped(
-                    event, provider_id=provider_id, allow_automatic=allow_automatic
+                    event, provider_id=provider_id, allow_automatic=allow_automatic,
+                    inherit_persona_visual=inherit_persona_visual, persona_visual_prompt=persona_visual_prompt,
                 )
         return await self._generate_persona_visual_projection_scoped(
-            event, provider_id=provider_id, allow_automatic=allow_automatic
+            event, provider_id=provider_id, allow_automatic=allow_automatic,
+            inherit_persona_visual=inherit_persona_visual, persona_visual_prompt=persona_visual_prompt,
         )
 
     async def _generate_persona_visual_projection_scoped(
-        self, event: Any, *, provider_id: str = "", allow_automatic: bool = True
+        self, event: Any, *, provider_id: str = "", allow_automatic: bool = True,
+        inherit_persona_visual: bool | None = None, persona_visual_prompt: str | None = None,
     ) -> str:
-        if not bool(getattr(self.settings, "life_publish_inherit_persona_visual", True)):
+        inherit_persona_visual = (
+            bool(getattr(self.settings, "life_publish_inherit_persona_visual", True))
+            if inherit_persona_visual is None else bool(inherit_persona_visual)
+        )
+        if not inherit_persona_visual:
             return ""
-        summary = str(getattr(self.settings, "life_publish_persona_visual_prompt", "") or "").strip()
+        summary = str(
+            getattr(self.settings, "life_publish_persona_visual_prompt", "")
+            if persona_visual_prompt is None else persona_visual_prompt
+        ).strip()
         if not allow_automatic and not summary:
             return ""
         if not allow_automatic:
             try:
-                resolved_umo = resolve_context_umo(self.context, self.settings, event)
-                persona = await resolve_persona_prompt(
-                    self.context, self.settings, event, resolved_umo=resolved_umo
-                )
+                snapshot = get_snapshot()
+                if snapshot is not None:
+                    persona = str(snapshot.get("persona_prompt") or "")
+                else:
+                    resolved_umo = resolve_context_umo(self.context, self.settings, event)
+                    persona = await resolve_persona_prompt(
+                        self.context, self.settings, event, resolved_umo=resolved_umo
+                    )
             except Exception:
                 raise PersonaConsistencyError("PROJECTION_FAILED") from None
             if not persona:
@@ -528,9 +543,13 @@ class QzoneLLM:
                     or ""
                 )
             snapshot = get_snapshot()
-            provider = (snapshot or {}).get("provider")
+            # Image-caption provider selection is independent from the frozen text
+            # provider. Honor the configured vision provider when it resolves.
+            provider = await self._provider_by_id(event, provider_id, strict=True) if provider_id else None
             if provider is None:
-                provider = await self._provider_by_id(event, provider_id)
+                provider = (snapshot or {}).get("provider")
+            if provider is None:
+                provider = await self._provider_by_id(event)
             text_chat = getattr(provider, "text_chat", None)
             if not callable(text_chat):
                 return "图片识别不可用，不能根据图片数量或链接猜测内容。"
@@ -736,7 +755,6 @@ class QzoneLLM:
     def _comment_context(self, post: QzonePost) -> str:
         lines = [f"说说内容：{truncate(post.summary or '(空)', 1200)}"]
         if post.images:
-            lines.append("图片：" + "，".join(truncate(item, 300) for item in post.images[:6]))
             lines.append(f"配图数量：{len(post.images[:9])} 张")
         visible_comments = [comment for comment in post.comments if comment.content][:8]
         if visible_comments:
@@ -762,10 +780,13 @@ class QzoneLLM:
         reasoning: str = "",
     ) -> str:
         async with generation_scope(timeout=90.0):
-            prompt = f"{self.settings.comment_prompt}\n\n{COMMENT_OUTPUT_RULES}\n\n{self._comment_context(post)}"
+            factual_context = self._comment_context(post)
+            prompt = f"{self.settings.comment_prompt}\n\n{COMMENT_OUTPUT_RULES}\n\n{factual_context}"
             if post.images:
                 await self.prepare_persona_snapshot(event, provider_id=provider_id or self.settings.comment_provider_id, prefer_current_provider=True)
-                prompt += "\n\n配图识别结果：\n" + await self.describe_images(event, post.images)
+                image_description = await self.describe_images(event, post.images)
+                prompt += "\n\n配图识别结果（内容事实）：\n" + image_description
+                factual_context += "\n配图描述：\n" + truncate(image_description, 1800)
             if reasoning:
                 prompt = f"{prompt}\n\nPipeline reasoning:\n{truncate(reasoning, 500)}"
             return await self.generate_guarded_text(
@@ -778,20 +799,22 @@ class QzoneLLM:
                     self._clean_generated_text(value, fields=("content", "comment", "text", "message"))
                 ),
                 task_context=self.settings.comment_prompt,
-                authoritative_facts=self._comment_context(post),
+                authoritative_facts=factual_context,
                 format_contract=f"Nonempty short comment, max {int(getattr(self.settings, 'comment_max_length', 60) or 60)} characters.",
             )
 
     async def generate_reply_text(self, event: Any, post: QzonePost, comment: QzoneComment) -> str:
         async with generation_scope(timeout=90.0):
-            prompt = (
-                f"{self.settings.reply_prompt}\n\n{COMMENT_OUTPUT_RULES}\n\n"
-                f"{self._comment_context(post)}\n"
-                f"要回复的评论：{truncate(comment.nickname or str(comment.uin), 80)}: {truncate(comment.content, 1000)}"
+            factual_context = (
+                f"{self._comment_context(post)}\n待回复评论："
+                f"{truncate(comment.nickname or str(comment.uin), 80)}: {truncate(comment.content, 1000)}"
             )
+            prompt = f"{self.settings.reply_prompt}\n\n{COMMENT_OUTPUT_RULES}\n\n{factual_context}"
             if post.images:
                 await self.prepare_persona_snapshot(event, provider_id=self.settings.reply_provider_id, prefer_current_provider=True)
-                prompt += "\n\n配图识别结果：\n" + await self.describe_images(event, post.images)
+                image_description = await self.describe_images(event, post.images)
+                prompt += "\n\n配图识别结果（内容事实）：\n" + image_description
+                factual_context += "\n配图描述：\n" + truncate(image_description, 1800)
             return await self.generate_guarded_text(
                 event,
                 prompt,
@@ -802,6 +825,6 @@ class QzoneLLM:
                     self._clean_generated_text(value, fields=("content", "comment", "reply", "text", "message"))
                 ),
                 task_context=self.settings.reply_prompt,
-                authoritative_facts=f"{self._comment_context(post)}\n{comment.content}",
+                authoritative_facts=factual_context,
                 format_contract=f"Nonempty short reply, max {int(getattr(self.settings, 'comment_max_length', 60) or 60)} characters.",
             )

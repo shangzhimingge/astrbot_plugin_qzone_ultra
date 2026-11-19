@@ -23,6 +23,25 @@ class LifeTimezoneError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class LifeDepictionSnapshot:
+    """Frozen selected visual identity and intended outfit for one Life operation."""
+
+    visual_persona_id: str = ""
+    outfit: str = ""
+    label: str = ""
+
+    def prompt_context(self) -> str:
+        facts = []
+        if self.visual_persona_id:
+            facts.append(f"视觉人设选择：{self.visual_persona_id}")
+        if self.label:
+            facts.append(f"本次形象标签：{self.label}")
+        if self.outfit:
+            facts.append(f"选定穿搭意图（仅为本次图像设定，不代表已确认的当前穿着）：{self.outfit}")
+        return "\n".join(facts)
+
+
+@dataclass(frozen=True, slots=True)
 class LifeClock:
     utc_now: datetime
     local_now: datetime

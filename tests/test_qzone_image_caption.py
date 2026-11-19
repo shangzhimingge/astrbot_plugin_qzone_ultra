@@ -6,6 +6,8 @@ import io
 import sys
 import types
 
+import pytest
+
 from PIL import Image
 from qzone_bridge.llm import QzoneLLM
 from qzone_bridge.social import QzoneComment, QzonePost
@@ -127,6 +129,102 @@ def test_comments_and_replies_use_image_descriptions_without_source_urls():
     for prompt in calls:
         assert "红色方块" in prompt
         assert "private.jpg" not in prompt
+
+
+def test_image_facts_are_carried_into_final_review_for_comment_and_reply():
+    settings = types.SimpleNamespace(
+        comment_prompt="写评论", reply_prompt="写回复",
+        comment_provider_id="", reply_provider_id="", comment_max_length=60,
+    )
+    adapter = QzoneLLM(types.SimpleNamespace(), settings)
+    review_facts = []
+
+    async def snapshot(*args, **kwargs):
+        return {}
+
+    async def caption(event, images):
+        return "图片描述：一只橘猫在窗台上。"
+
+    async def guarded(event, prompt, **kwargs):
+        review_facts.append(kwargs["authoritative_facts"])
+        return "窗边的橘猫真可爱"
+
+    adapter.prepare_persona_snapshot = snapshot
+    adapter.describe_images = caption
+    adapter.generate_guarded_text = guarded
+    post = QzonePost(
+        hostuin=12345, fid="post", summary="分享照片",
+        images=["https://example.invalid/cat.jpg"],
+    )
+    comment = QzoneComment(
+        commentid="comment", uin=12346, nickname="Friend", content="这是什么动物？"
+    )
+    assert asyncio.run(adapter.generate_comment_text(None, post))
+    assert asyncio.run(adapter.generate_reply_text(None, post, comment))
+    assert len(review_facts) == 2
+    assert all("一只橘猫在窗台上" in facts for facts in review_facts)
+    assert all("cat.jpg" not in facts for facts in review_facts)
+
+
+@pytest.mark.parametrize("operation", ["comment", "reply"])
+def test_real_caption_generation_review_and_rewrite_share_one_budget_and_facts(operation: str):
+    image = Image.new("RGB", (128, 128), "orange")
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    source = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    calls = []
+
+    class Provider:
+        async def text_chat(self, **kwargs):
+            calls.append(kwargs)
+            if "image_urls" in kwargs:
+                return {"completion_text": "图片内容事实：橘猫坐在窗台上。"}
+            prompt = kwargs.get("prompt", "")
+            if "Review whether FINAL_TEXT" in prompt:
+                review_calls = sum("Review whether FINAL_TEXT" in item.get("prompt", "") for item in calls)
+                if review_calls == 1:
+                    return {"completion_text": '{"accepted":false,"rewrite":"橘猫在窗边晒太阳。"}'}
+                return {"completion_text": '{"accepted":true,"rewrite":""}'}
+            return {"completion_text": "橘猫照片很可爱。"}
+
+    provider = Provider()
+    class PersonaManager:
+        async def get_persona_v3_by_id(self, persona_id):
+            assert persona_id == "voice-1"
+            return {"prompt": "保持温和简洁的说话风格"}
+    class Context:
+        persona_manager = PersonaManager()
+        def __init__(self): self.provider_ids = []
+        def get_provider_by_id(self, provider_id):
+            self.provider_ids.append(provider_id)
+            return provider
+        def get_config(self, _umo=None):
+            return {"provider_settings": {"default_image_caption_provider_id": "other-provider"}}
+
+    settings = types.SimpleNamespace(
+        comment_prompt="请写一句评论", reply_prompt="请写一句回复",
+        comment_provider_id="pinned-provider", reply_provider_id="pinned-provider",
+        comment_max_length=60, persona_id="voice-1", persona_consistency_check=True,
+        life_publish_inherit_persona_visual=False,
+    )
+    context = Context()
+    adapter = QzoneLLM(context, settings)
+    post = QzonePost(hostuin=12345, fid="post", summary="朋友分享了照片", images=[source])
+    comment = QzoneComment(commentid="cid", uin=10001, nickname="朋友", content="这是什么？")
+    result = asyncio.run(
+        adapter.generate_comment_text(None, post) if operation == "comment"
+        else adapter.generate_reply_text(None, post, comment)
+    )
+    assert result == "橘猫在窗边晒太阳"
+    assert len(calls) == 4  # one caption, one candidate, one bounded rewrite and one final review
+    assert sum("image_urls" in call for call in calls) == 1
+    reviews = [call["prompt"] for call in calls if "Review whether FINAL_TEXT" in call.get("prompt", "")]
+    facts = [prompt.split("<FACTS_DATA>", 1)[1].split("</FACTS_DATA>", 1)[0] for prompt in reviews]
+    assert len(reviews) == 2 and facts[0] == facts[1]
+    assert all("橘猫坐在窗台上" in prompt for prompt in reviews)
+    assert all("voice-1" not in str(call) and source not in str(call) for call in calls)
+    assert context.provider_ids.count("other-provider") == 1
+    assert "pinned-provider" in context.provider_ids
 
 
 def test_view_keeps_image_descriptions_when_the_reply_provider_fails(monkeypatch):

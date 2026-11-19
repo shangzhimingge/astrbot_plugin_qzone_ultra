@@ -25,6 +25,7 @@ from typing import Any, Callable, Awaitable
 from urllib.parse import unquote_to_bytes, urlparse
 
 from .errors import DaemonUnavailableError, LifeGenerationError, QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .drafts import public_publish_result
 from .media import (
     QZONE_IMAGE_SUFFIXES,
     QZONE_MAX_IMAGES,
@@ -345,40 +346,70 @@ class QzonePageApi:
             await self._life_jobs.attach_task(job.id, task)
         data = PageLifeJobStore.public_payload(job)
         data["capability"] = capability
+        data["request_id"] = request_id
         return _success(data, message="草稿生成任务已接收。" if created else "已关联现有草稿生成任务。")
 
     async def get_life_draft(self, params: Any = None) -> dict[str, Any]:
         params = params or {}
-        if not isinstance(params, dict) or set(params) - {"id"}:
+        if not isinstance(params, dict) or set(params) - {"id", "request_id"}:
             raise PageLifeError("LIFE_INVALID_REQUEST", "日常草稿查询参数无效。")
         _, account_uin = await self._life_owner_status()
         await self._prune_life_media()
         job_id = str(params.get("id") or "").strip()
+        request_id = str(params.get("request_id") or "").strip()
+        job: PageLifeJob | None = None
         if job_id:
             try:
                 job = await self._life_jobs.get(job_id, account_uin)
             except PageLifeError as exc:
                 if exc.code != "LIFE_EXPIRED":
                     raise
-                job = await self._recover_life_job(job_id, account_uin)
+        elif request_id:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", request_id, flags=re.ASCII):
+                raise PageLifeError("LIFE_INVALID_REQUEST", "日常草稿查询参数无效。")
+            job = await self._life_jobs.get_by_request(request_id, account_uin)
+            job_id = job.id if job else ""
         else:
             job = await self._life_jobs.active_or_latest(account_uin)
+            job_id = job.id if job else ""
+            if not job_id and self.draft_store is not None:
+                owned = [draft for draft in await self.draft_store.list_async()
+                         if draft.life_job_id and draft.life_owner_uin == int(account_uin)]
+                if owned:
+                    latest = max(owned, key=lambda item: item.id)
+                    if latest.status in {"published", "publishing", "unknown", "approved"}:
+                        job_id = latest.life_job_id
+
+        durable = await self._durable_life_draft(job_id, account_uin) if job_id else None
+        if durable is not None and durable.status in {"published", "publishing", "unknown", "approved"}:
+            # Durable publication authority wins over any stale in-memory display cache.
+            job = self._job_from_durable_draft(durable)
+        elif job is None and str(params.get("id") or "").strip():
+            # A durable pending draft remains available to chat review, but an expired
+            # Page capability is never reconstructed as a fresh ready-to-publish job.
+            raise PageLifeError("LIFE_EXPIRED", "日常草稿任务已过期，请重新生成。")
+
         data = PageLifeJobStore.public_payload(job) if job else {"state": "idle"}
+        if request_id and job is not None:
+            data["request_id"] = request_id
         data["capability"] = self._life_capability_status()
         return _success(data)
 
-    async def _recover_life_job(self, job_id: str, account_uin: int) -> PageLifeJob:
+    async def _durable_life_draft(self, job_id: str, account_uin: int):
         if self.draft_store is None:
-            raise PageLifeError("LIFE_EXPIRED", "日常草稿任务已过期，请重新生成。")
+            return None
         drafts = await self.draft_store.list_async()
         draft = next((item for item in drafts if item.life_job_id == str(job_id)), None)
-        if draft is None:
-            raise PageLifeError("LIFE_EXPIRED", "日常草稿任务已过期，请重新生成。")
-        if draft.life_owner_uin != int(account_uin):
+        if draft is not None and draft.life_owner_uin != int(account_uin):
             raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，请切回原账号后查询。")
+        return draft
+
+    @staticmethod
+    def _job_from_durable_draft(draft: Any) -> PageLifeJob:
         publish_state = {
-            "pending": "ready", "publishing": "sending", "unknown": "unknown", "published": "published",
-        }.get(draft.status, "unknown")
+            "publishing": "sending", "unknown": "unknown", "published": "published",
+            "approved": "unknown",
+        }[draft.status]
         now = time.time()
         return PageLifeJob(
             id=draft.life_job_id, request_ids=set(), account_uin=draft.life_owner_uin,
@@ -389,6 +420,12 @@ class QzonePageApi:
             publish_result=dict(draft.publish_result) if draft.publish_result else None,
             publish_diagnostic=public_diagnostic(draft.publish_diagnostic),
         )
+
+    async def _recover_life_job(self, job_id: str, account_uin: int) -> PageLifeJob:
+        draft = await self._durable_life_draft(job_id, account_uin)
+        if draft is None or draft.status not in {"published", "publishing", "unknown", "approved"}:
+            raise PageLifeError("LIFE_EXPIRED", "日常草稿任务已过期，请重新生成。")
+        return self._job_from_durable_draft(draft)
 
     async def _run_life_generation(self, job_id: str, account_uin: int) -> None:
         try:
@@ -1165,7 +1202,7 @@ class QzonePageApi:
                 life_owner_uin=life_job.account_uin,
             )
             if draft_claim.get("state") == "already_published":
-                return _success(dict(draft_claim.get("result") or {}), message="说说已发布。")
+                return _success(public_publish_result(draft_claim.get("result")), message="说说已发布。")
             if draft_claim.get("state") != "acquired":
                 existing_draft = draft_claim.get("draft")
                 if getattr(existing_draft, "status", "") == "published":
@@ -1176,7 +1213,22 @@ class QzonePageApi:
                 raise PageLifeError(code, f"发布结果尚不确定，该日常草稿当前已锁定，系统不会自动重试。{suffix}")
             digest = str(draft_claim["digest"])
             if not recovered_life_job:
-                life_job, should_send = await self._life_jobs.begin_publish(life_job_id, life_job.account_uin, digest)
+                try:
+                    life_job, should_send = await self._life_jobs.begin_publish(life_job_id, life_job.account_uin, digest)
+                except asyncio.CancelledError:
+                    await asyncio.shield(self.draft_store.release_publish_async(
+                        life_job.draft_id, token=str(draft_claim["token"]),
+                        account_uin=life_job.account_uin, digest=digest,
+                    ))
+                    await asyncio.shield(self._life_jobs.release_publish(life_job_id, digest))
+                    raise
+                except Exception:
+                    await self.draft_store.release_publish_async(
+                        life_job.draft_id, token=str(draft_claim["token"]),
+                        account_uin=life_job.account_uin, digest=digest,
+                    )
+                    await self._life_jobs.release_publish(life_job_id, digest)
+                    raise
                 if not should_send:
                     await self.draft_store.mark_unknown_async(
                         life_job.draft_id, token=str(draft_claim["token"]),
@@ -1206,6 +1258,10 @@ class QzonePageApi:
                 "photo_count": _to_int(payload.get("photo_count"), len(media)),
             }
             fid = str(payload.get("fid") or "")
+            if life_job is not None:
+                if not fid and not (payload.get("verified") is True and payload.get("success") is True):
+                    raise RuntimeError("protected publication returned no positive success receipt")
+                data["fid"] = fid
             login_uin = _to_int(status.get("login_uin") or status.get("uin"), 0)
             if fid and login_uin:
                 created_at = int(time.time())
@@ -1240,7 +1296,7 @@ class QzonePageApi:
                     token=str(draft_claim["token"]),
                     account_uin=life_job.account_uin,
                     digest=digest,
-                    result=data,
+                    result=public_publish_result(data),
                     fid=fid,
                 ):
                     raise RuntimeError("draft publication completion was not persisted")
@@ -1270,6 +1326,12 @@ class QzonePageApi:
                 await asyncio.shield(self._life_jobs.mark_unknown(life_job.id, diagnostic=diagnostic))
             raise
         except Exception as error:
+            trusted_pre_dispatch = False
+            if type(error) is DaemonUnavailableError:
+                detail = getattr(error, "detail", None)
+                trusted_pre_dispatch = isinstance(detail, dict) and detail.get("request_dispatched") is False
+            if trusted_pre_dispatch:
+                dispatched = False
             diagnostic = None
             if draft_claim is not None and not dispatched:
                 await self.draft_store.release_publish_async(
@@ -1290,6 +1352,8 @@ class QzonePageApi:
                 retained = public_diagnostic(life_job.publish_diagnostic) or diagnostic
                 raise PageLifeError("LIFE_UNKNOWN",
                     f"发布结果尚不确定，请查询空间状态；系统不会自动重试。{retained['code']} {retained['id']}") from None
+            if trusted_pre_dispatch and life_job is not None:
+                raise PageLifeError("LIFE_PRE_DISPATCH", "后台请求确认未发送；草稿仍可由用户明确重试。") from None
             raise
 
     async def like(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
