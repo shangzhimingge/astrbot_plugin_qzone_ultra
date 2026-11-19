@@ -2564,10 +2564,12 @@ class QzoneDaemonService:
         media: list[dict[str, Any]] | None = None,
         content_sanitized: bool = False,
         expected_login_uin: int | None = None,
+        retry_writes: bool = True,
     ) -> dict[str, Any]:
         if expected_login_uin is None:
             return await self._publish_post_impl(
-                content=content, sync_weibo=sync_weibo, media=media, content_sanitized=content_sanitized
+                content=content, sync_weibo=sync_weibo, media=media, content_sanitized=content_sanitized,
+                retry_writes=retry_writes,
             )
         async with self._session_target_lock:
             live_session = getattr(self.client, "session", None)
@@ -2581,10 +2583,32 @@ class QzoneDaemonService:
             ):
                 raise QzoneNeedsRebind("登录账号已变化，日常草稿未发布。")
             return await self._publish_post_impl(
-                content=content, sync_weibo=sync_weibo, media=media, content_sanitized=content_sanitized
+                content=content, sync_weibo=sync_weibo, media=media, content_sanitized=content_sanitized,
+                retry_writes=False,
             )
 
     async def _publish_post_impl(
+        self,
+        *,
+        content: str,
+        sync_weibo: bool = False,
+        media: list[dict[str, Any]] | None = None,
+        content_sanitized: bool = False,
+        retry_writes: bool = True,
+    ) -> dict[str, Any]:
+        policy = getattr(self.client, "write_retry_policy", None)
+        if callable(policy):
+            async with policy(retry_writes):
+                return await self._publish_post_impl_scoped(
+                    content=content, sync_weibo=sync_weibo, media=media,
+                    content_sanitized=content_sanitized,
+                )
+        return await self._publish_post_impl_scoped(
+            content=content, sync_weibo=sync_weibo, media=media,
+            content_sanitized=content_sanitized,
+        )
+
+    async def _publish_post_impl_scoped(
         self,
         *,
         content: str,
@@ -2691,20 +2715,35 @@ class QzoneDaemonService:
         comment_uin: int,
         content: str,
         appid: int = 311,
+        expected_login_uin: int | None = None,
+        retry_writes: bool = True,
     ) -> dict[str, Any]:
         if not content.strip():
             raise QzoneParseError("回复内容不能为空")
+        if expected_login_uin is not None:
+            async with self._session_target_lock:
+                live_session = getattr(self.client, "session", None)
+                if (self.state.session.uin != int(expected_login_uin) or live_session is None
+                        or live_session.uin != int(expected_login_uin) or self._session_needs_rebind()
+                        or live_session.needs_rebind or not live_session.cookies):
+                    raise QzoneNeedsRebind("登录账号已变化，评论未发送。")
+                return await self._reply_comment_impl(hostuin, fid, commentid, comment_uin, content, appid, False)
+        return await self._reply_comment_impl(hostuin, fid, commentid, comment_uin, content, appid, retry_writes)
+
+    async def _reply_comment_impl(self, hostuin: int, fid: str, commentid: str, comment_uin: int,
+                                  content: str, appid: int, retry_writes: bool) -> dict[str, Any]:
         self._ensure_session_ready()
-        payload = unwrap_payload(
-            await self.client.reply_comment(
-                hostuin,
-                fid,
-                commentid,
-                comment_uin,
-                content,
-                appid=appid,
+        async with self.client.write_retry_policy(retry_writes):
+            payload = unwrap_payload(
+                await self.client.reply_comment(
+                    hostuin,
+                    fid,
+                    commentid,
+                    comment_uin,
+                    content,
+                    appid=appid,
+                )
             )
-        )
         if not isinstance(payload, dict):
             raise QzoneParseError("回复评论返回格式异常")
         self._set_success(defer_save=True)
@@ -3175,12 +3214,15 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             media = body.get("media") or body.get("attachments") or body.get("photos") or []
             expected_login_uin = body.get("expected_login_uin")
             expected_login_uin = _body_int(body, "expected_login_uin", 0) if expected_login_uin is not None else None
+            if "retry_writes" in body and type(body["retry_writes"]) is not bool:
+                raise QzoneParseError("retry_writes must be a boolean")
             return await service.publish_post(
                 content=content,
                 sync_weibo=_body_bool(body, "sync_weibo", False),
                 media=media,
                 content_sanitized=_body_bool(body, "content_sanitized", False),
                 expected_login_uin=expected_login_uin,
+                retry_writes=body.get("retry_writes", True),
             )
 
         return await _bridge_response(
@@ -3207,6 +3249,8 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
 
     async def reply(request: web.Request) -> web.Response:
         body = await _json_body(request)
+        if "retry_writes" in body and type(body["retry_writes"]) is not bool:
+            raise QzoneParseError("retry_writes must be a boolean")
         return await _bridge_response(
             service,
             lambda: service.reply_comment(
@@ -3220,6 +3264,9 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
                 ),
                 content=str(body.get("content") or ""),
                 appid=_body_int(body, "appid", 311),
+                expected_login_uin=(_body_int(body, "expected_login_uin", 0)
+                                   if body.get("expected_login_uin") is not None else None),
+                retry_writes=body.get("retry_writes", True),
             ),
         )
 

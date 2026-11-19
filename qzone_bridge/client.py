@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+from contextlib import asynccontextmanager
 import base64
 import json
 import time
@@ -70,6 +72,8 @@ from .source_policy import (
     is_windows_drive_path,
 )
 from .utils import extract_callback_json, json_loads, now_iso
+
+_RETRY_WRITES: contextvars.ContextVar[tuple[int, bool] | None] = contextvars.ContextVar("qzone_retry_writes", default=None)
 
 log = get_logger(__name__)
 H5_VIDEO_REQUEST_TIMEOUT_SECONDS = 300.0
@@ -295,8 +299,9 @@ class QzoneClient:
             code = int(raw_code or 0)
         except (TypeError, ValueError):
             code = 0
-        message = str(detail.get("message") or detail.get("msg") or exc)
-        return code == -10005 or "未输入内容" in message
+        # Only the structured validation code proves the server rejected this
+        # request before creating/updating a post; message text is not enough.
+        return code == -10005
 
     def _raise_payload_error(self, payload: Any, response: httpx.Response) -> None:
         if not isinstance(payload, dict):
@@ -466,7 +471,12 @@ class QzoneClient:
             raise QzoneNeedsRebind("Cookie 缺少 p_skey 或 skey，无法计算 g_tk")
 
         params = self._merge_params(params, hostuin=hostuin, attach_token=attach_token)
-        attempts = self.max_retries if max_attempts is None else max(1, int(max_attempts))
+        write_policy = _RETRY_WRITES.get()
+        protected_write = (method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+                           and write_policy is not None and write_policy[0] == id(self) and not write_policy[1])
+        attempts = 1 if protected_write else (self.max_retries if max_attempts is None else max(1, int(max_attempts)))
+        if protected_write:
+            follow_qzone_redirects = False
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
@@ -559,6 +569,14 @@ class QzoneClient:
                 await asyncio.sleep(min(2.0 * attempt, 6.0))
         assert last_exc is not None
         raise last_exc
+
+    @asynccontextmanager
+    async def write_retry_policy(self, retry_writes: bool):
+        token = _RETRY_WRITES.set((id(self), bool(retry_writes)))
+        try:
+            yield
+        finally:
+            _RETRY_WRITES.reset(token)
 
     @staticmethod
     def _parse_response_payload(text: str, response: httpx.Response) -> Any:
@@ -1363,7 +1381,11 @@ class QzoneClient:
             )
             errors = [result for result in results if isinstance(result, Exception)]
             if errors:
-                if not all(isinstance(error, QzoneRequestError) for error in errors):
+                policy = _RETRY_WRITES.get()
+                protected_scope = bool(policy and policy[0] == id(self) and not policy[1])
+                if protected_scope or not all(isinstance(error, QzoneRequestError) for error in errors):
+                    # In a protected single-attempt publication, an upload error
+                    # may follow an accepted write with a lost response.
                     raise errors[0]
                 log.debug("parallel qzone image upload failed; retrying failed items sequentially", exc_info=errors[0])
                 for (index, photo), result in zip(pending, results):

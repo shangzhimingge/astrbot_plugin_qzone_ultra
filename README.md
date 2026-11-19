@@ -6,11 +6,21 @@ QQ空间Ultra 是一个面向 AstrBot 的 QQ 空间插件，提供中文命令�
 
 交流与反馈：**[点击加入 QQ 群 1081773675](https://qm.qq.com/q/Qr45Vz0a8o)**
 
-本 Fork 的可安装源码仓库为 [shangzhimingge/astrbot_plugin_qzone_ultra](https://github.com/shangzhimingge/astrbot_plugin_qzone_ultra)。本页标出的 Fork 增量功能是本仓库维护的改动；上游来源与致谢见上文。
+0.9.9 修复跨 Page/聊天的持久化发布声明、单次写请求和未知结果恢复；并集成图片描述、OmniDraw 单次人设选择及随机评论通知开关。
 
 Pages 中 Life 草稿载入、清空和确认发布使用插件页内确认框，以兼容 AstrBot 限制原生浏览器确认弹窗的 iframe。Life 发布在确认后会重新核对账号、草稿和编辑器快照；普通说说发布仍沿用原有交互。
 
-## 此 Fork 的增量功能
+本 Fork 的安装仓库为 [shangzhimingge/astrbot_plugin_qzone_ultra](https://github.com/shangzhimingge/astrbot_plugin_qzone_ultra)。
+
+## 此 Fork 的 0.9.9 更新概览
+
+- Page 和聊天投稿共享草稿库中的持久化发布声明。发布内容、媒体、账号与声明令牌在首次外部写入前保存；完成状态和结果未知状态在重启后保留。结果未知只允许查询/检查，不会自动重发；仅收到可信的明确“请求未发送”证明时，才释放声明供用户显式再次点击。运行中的 Life 任务与预览仍是短期状态。
+- 所有不确定结果的写操作使用单次端到端请求，包含 daemon 与 QQ HTTP 传输层；自动回评先持久预留每日额度，再调用 LLM，并在失败或取消时依照发送边界处理预留。
+- 评论批处理逐项报告审核/发送失败并保留成功结果。点赞出错仍返回已经发送的评论，外部取消继续传播。
+- Life 页面以请求编号关联任务；网络丢失、模糊响应或查询到无关任务时，点击/刷新只查询原编号，不结束恢复状态或自动 POST；只有明确未受理拒绝才结束恢复，重试须用户再次点击。
+- 评论/回复图片描述在同一有界生成操作中复用固定 Persona/provider、共享调用预算和期限；URL 不作为模型事实。Life 图像场景仅在来源日期可验证且有明确覆盖冻结生成时刻的区间时使用为当前计划；其他时段仅按带日期的回顾或计划呈现，时间不明则不推断活动。图片画风、配文设置及本次选择的人设/穿搭在操作开始时冻结；选定穿搭只是本次图像设定，不证明现实中的当前穿着。随机评论通知默认开启，关闭仅关闭通知，不关闭评论。
+
+## 0.9.8 更新概览
 
 ### Life 生成分阶段时限（0.9.8）
 
@@ -24,9 +34,9 @@ Life 日常说说配置中新增三个秒数预算：`generation_timeout_seconds
 
 Life 发布结果仍按原规则保守标记为“未确认”，系统不会因诊断信息自动重试或重置状态。0.9.7 起，保留中的任务状态会额外显示固定错误类别、处理阶段和短编号；图片预览诊断与发布结果分开显示，预览失败不代表发布失败原因。诊断不包含原始异常、媒体 URL、Cookie 或草稿正文。
 
-本修复改进的是**后续失败的可观测性**，并未查明此前某次 `LIFE_UNKNOWN` 的实际原因，也不能据此判断 QQ 说说是否已创建。Life 任务及其诊断仅保存在插件进程内存中；插件重载/进程重启会丢失这些临时任务和诊断，插件草稿库中已经保存的原草稿数据仍按既有机制保留。不要为了获取诊断而重新发布结果未明的草稿。若后续任务仍出现问题，可提供界面显示的固定类别、阶段和短编号。
+本修复改进的是**后续失败的可观测性**，并未查明此前某次 `LIFE_UNKNOWN` 的实际原因，也不能据此判断 QQ 说说是否已创建。运行中的 Life 生成任务及预览诊断仅保存在插件进程内存中；插件重载/进程重启会清除这些临时状态。草稿库中的发布声明、已发布状态及结果未知状态则持久保存，未知结果不因重启恢复为可发布。不要为了获取诊断而重新发布结果未明的草稿。若后续任务仍出现问题，可提供界面显示的固定类别、阶段和短编号。
 
-以下是此 Fork 新增的功能，不代表上游仓库已有同样实现：LLM 文本生成继承 AstrBot 当前选中人格，并可在最终文案阶段执行有界一致性复核；Life 图像提示可继承经严格来源片段校验的视觉属性；Pages 中“AI 生成评论/回复”只生成可编辑草稿，不会自动提交；Pages 说说编辑器可生成 Life 日常草稿，保存后须用户载入、编辑并明确确认发布；可选的“自动回复自己说说的新评论”默认关闭，启用后首次成功扫描会先为现有评论建立基线，并对发送前再次确认的新增评论执行限额回复。自动回评状态保存在插件数据目录 `auto_reply_state.json`；遇到发送结果不确定时会保留状态并避免自动重发。
+本次更新包含 Persona 上下文解析和有界一致性复核、Life 时间/画风快照、Pages 手动日常草稿与页内发布确认、AI 评论/回复草稿，以及默认关闭的自说说新评论自动回评。AI 评论与回复只填入可编辑框，不会自动发送；Life 日常草稿须用户载入、编辑并明确确认后才发布。自动回评首次扫描会为现有评论建立基线，发送前再次读取评论并受速率与每日额度限制；发送结果不确定时保留处理状态，不自动重发。
 
 ### Pages 手动生成日常草稿
 
@@ -52,7 +62,7 @@ QzoneUltra 现在可以把 **Life Scheduler 日程插件** 和 **OmniDraw 自拍
 
 - `life_publish.timezone` 默认 `Asia/Shanghai`，用于把一次 Life 生成开始时的时刻与 Scheduler 来源日期/时间对齐。也可填写 `UTC+08:00`（不依赖 IANA 时区数据）；无效或不可用时区会中止该次 Life 操作，不会静默改用主机时区。
 - 只有带可识别日期和明确覆盖当前时刻的区间才作为图片当前场景；过往节点仅作为带日期的回顾素材，未来节点只作为计划。点状时间不代表活动持续到下一项；缺少来源日期/时间时按未知处理。图片使用中性近景，不从旧日程推断睡眠、地点或当前穿着。
-- `life_publish.image_style_prompt` 默认请求日系二次元厚涂插画，可在配置中调整；留空关闭这项新增画风提示。它是提示词层面的约束，并不保证具体模型或生成结果一定符合指定画风。
+- `life_publish.image_style_prompt` 在个人 Fork 中默认请求日系二次元厚涂插画，可填写自定义提示词；留空关闭画风提示。提交给上游的版本默认留空。它是提示词层面的约束，并不保证具体模型或生成结果一定符合指定画风。
 - 图片提示、配文及最终动作共用本次开始时冻结的时间和画风，即使异步生成期间跨过午夜也不会混用新旧时间。
 
 ## 功能概览
@@ -64,7 +74,7 @@ QzoneUltra 现在可以把 **Life Scheduler 日程插件** 和 **OmniDraw 自拍
 - 看说说、读说说、评论说说、点赞说说和自动评论反馈可复用同款 QQ 空间风格说说卡片渲染。
 - 表白墙投稿、匿名投稿、撤稿、看稿、过稿、拒稿。
 - 定时自动发说说、自动评论好友最新动态，并记录已处理动态，避免重复打扰；其中自动发说说可联动 Life Scheduler + OmniDraw，把今日行程生成自拍图和日常文案后自动发布。
-- 收到消息概率触发自动评论时，会在当前触发会话返回包含原说说和自己评论的 QQ 空间风格渲染图。
+- 收到消息概率触发自动评论时，默认在当前触发会话返回包含原说说和自己评论的 QQ 空间风格渲染图；可通过 `trigger.random_comment_notify=false` 关闭聊天反馈。
 - Google News RSS 新闻说说：可按数量获取候选新闻并排序缓存，也可选择序号让 LLM 写成原创短评后立即发布或定时发布。
 - 可选 pillowmd 风格渲染；渲染失败时自动回退文本。
 - LLM tool 结果会转成自然语言回复，避免向用户暴露 raw JSON、fid、cursor 等内部字段。
@@ -86,8 +96,7 @@ pip install -r requirements.txt
 ### 开发测试
 
 - 仅安装插件依赖的环境（例如仓库 CI）可运行 `python -m pytest -q`；依赖 AstrBot core 的 Persona/MessageSession 合同集成模块会显式 skip，其余插件测试仍照常执行。
-- 完整集成测试需安装兼容的 AstrBot core；本次源码与会话合同核查使用本机 AstrBot `4.27.5`，运行 `python -m pytest -q` 应包含全部 Persona/session 测试。
-- 不要将插件-only 环境下的测试结果表述为 Persona/session 集成测试已运行。
+- 完整集成测试需安装兼容的 AstrBot core；插件依赖环境下，Persona/MessageSession 合同模块会显式标记为跳过，不代表该集成路径已执行。
 
 插件会在首次使用时按需启动本地 daemon。daemon 默认使用 `18999` 端口并只监听 `127.0.0.1`，用于隔离 QQ 空间请求、Cookie 管理和渲染逻辑。除非端口被占用，不建议修改默认端口；如果系统防火墙或安全软件拦截本地连接，请放行本插件的 `18999` 端口。
 
@@ -102,6 +111,8 @@ pip install -r requirements.txt
 ```
 
 插件安装、下载后重载或 AstrBot 启动时会自动尝试执行一次 autobind；如果当时 OneBot 客户端稍后才就绪，插件会在首次捕获 OneBot/aiocqhttp 事件后补触发。自动绑定最多尝试 3 次，仍失败时再使用上面的命令或手动 Cookie 绑定。
+
+本地离线 Cookie 首次绑定只会在当前 controller 明确观察到其自有 daemon 子进程退出、确认请求尚未发送且监听端口已释放后执行。设置 `auto_start_daemon=false` 不会建立这类退出凭据，因此在没有该凭据时不会通过离线回退写入首次绑定；请保持 daemon 可用并通过正常绑定流程操作。
 
 如果平台无法提供 Cookie，可以手动绑定：
 
@@ -200,7 +211,7 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `llm.news_provider_id` | 空 | 新闻说说使用的 LLM provider；空时优先回退写说说 provider |
 | `llm.comment_provider_id` | 空 | 评论使用的 LLM provider |
 | `llm.reply_provider_id` | 空 | 回评使用的 LLM provider |
-| `llm.persona_id` | 空 | 此 Fork 中仅用于定时/Pages 等无会话上下文生成；留空时沿用 AstrBot 当前选中人格 |
+| `llm.persona_id` | 空 | 用于定时/Pages 等无会话上下文生成；留空时沿用 AstrBot 当前选中人格 |
 | `llm.context_umo` | 空 | 定时/Pages 草稿使用的 AstrBot 会话（如 `平台实例ID:GroupMessage:群号` 或 `平台实例ID:FriendMessage:QQ号`）；为空时仅在唯一 aiocqhttp 实例下由管理群/管理员推导，实例缺失或不唯一时使用全局默认上下文，不猜实例。显式 `persona_id` 仍只选择人格，`context_umo` 用于会话/配置上下文；真实消息始终使用消息自身会话 |
 | `llm.persona_consistency_check` | `true` | 有非空选中人格时，对清理/截断后的最终说说、新闻、评论、回复和自动配文执行严格复核；通常额外1次复核，需改写时最多2次，失败则跳过发送。关闭可维持旧行为。每个逻辑操作共享最多6次Provider调用；普通文本任务预算90秒，Life 使用单独的生成总时限和阶段时限 |
 | `life_publish.inherit_persona_visual` | `true` | Life 图像提示是否继承视觉资料；禁用或选中人格为空/禁用时不提取 |
@@ -208,7 +219,7 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `life_publish.generation_timeout_seconds` | `300` | Life 生成总时限（30–1800 秒）；不含草稿保存、QQ 发布及通知 |
 | `life_publish.image_timeout_seconds` | `180` | OmniDraw 单次生图及全部重试的时限（10–1200 秒） |
 | `life_publish.text_timeout_seconds` | `90` | 自拍提示词、配文/复核各自独立使用的阶段时限（5–600 秒） |
-| `auto_reply.enabled` | `false` | 此 Fork 的自说说新增评论自动回复开关；默认关闭 |
+| `auto_reply.enabled` | `false` | 自说说新增评论自动回复开关；默认关闭 |
 | `auto_reply.poll_interval` | `120` | 自动回评轮询间隔（秒） |
 | `auto_reply.delay_min` / `auto_reply.delay_max` | `30` / `180` | 自动回评发送前随机等待范围（秒） |
 | `auto_reply.recent_posts` | `5` | 每轮检查自己的最近说说数量 |
@@ -222,7 +233,8 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 | `trigger.comment_latest_count` | `1` | 每次定时自动评论从好友最新动态中处理的未评论说说条数 |
 
 | `trigger.read_prob` | `0.0` | 收到消息时概率触发读说说和自动评论 |
-| `trigger.send_admin` | `false` | 定时发布、定时评论后向管理群或管理员私聊发送结果和渲染图；收到消息概率触发的自动评论会发回当前会话 |
+| `trigger.random_comment_notify` | `true` | 消息随机触发自动评论后，向原群或私聊发送结果卡片；关闭后静默评论，仍按配置执行点赞 |
+| `trigger.send_admin` | `false` | 定时发布、定时评论后向管理群或管理员私聊发送结果和渲染图；随机评论的聊天反馈由 `trigger.random_comment_notify` 控制 |
 | `news.scopes` | `["china"]` | 新闻范围，可填 `china`、`world`、`mixed`，也支持 `中国`、`国际`、`混合` |
 | `news.keywords` | 空 | 额外 Google News RSS 搜索关键词列表 |
 | `news.custom_rss_urls` | 空 | 自定义 Google News RSS 地址列表，仅允许 `https://news.google.com/rss...` |
@@ -264,7 +276,7 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 开启后，`trigger.publish_cron` 触发时会先走这条链路：
 
 1. 调用 `astrbot_plugin_life_scheduler.get_life_context()` 获取今日日程
-2. 把日程交给 LLM 生成适合 OmniDraw 自拍模式的提示词
+2. 如果 OmniDraw 提供 `resolve_selfie_context()`，先根据当前活动和当天穿搭选择本次人设，再把选定的穿搭交给 LLM 生成自拍提示词
 3. 调用 OmniDraw 的 `generate_selfie(return_result=true)` 获取返回式图片
 4. 自动配文并发说说，或按配置写入草稿
 
@@ -289,5 +301,10 @@ LLM tools 中会读取或改变已绑定 QQ 空间状态的工具默认只允许
 - 人格提示词注入和复核可改善一致性，但模型输出不保证完全遵循；插件不强制固定口头禅或句尾词。
 - 如果 Life Scheduler 或 OmniDraw 出现非超时错误，会按 `failure_policy` 处理。
 - OmniDraw 未返回图片或调用抛出非超时错误时，会按 `life_publish.image_retry_count` 重试；超时不重试，每次仍强制传 `return_result=true`。
+- 支持自动人设选择的 OmniDraw 会把选定的人设 ID 传入本次自拍；配图提示词和说说配文使用同一份穿搭上下文，不修改全局默认人设。先在 OmniDraw 的“自动自拍人设选择”中开启功能，并把工作服、睡衣等映射到已有的人设 ID。
+- Life Scheduler 提供 `current_activity` 和 `current_time` 时，仅在来源日期、时间可解析且明确覆盖本次冻结生成时刻时，才作为当前计划写入图片场景；点状时刻不会延伸到下一项。模板应以筛选后的计划、本次人设和本次穿搭为准，全天日程仅作背景；未验证或缺少时刻时按未知处理。
+- 旧版 OmniDraw 没有选择接口时继续使用原自拍流程；选择接口出错时也会回退到原流程。
+- 如果 Life Scheduler 或 OmniDraw 不可用，会按 `failure_policy` 处理。
+- OmniDraw 未返回图片或调用抛错时，会按 `life_publish.image_retry_count` 重试，每次仍强制传 `return_result=true`。
 - 关闭 `life_publish.enabled` 后，`trigger.publish_cron` 会退回原来的纯文本定时发说说。
 - 管理员可发送 `发日常说说` 立即跑完整链路并直接发布；该指令会沿用各项日程/LLM/OmniDraw 开关，但会强制发布，不受 `life_publish.mode=draft` 影响。

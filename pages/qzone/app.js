@@ -1997,6 +1997,9 @@ function setLifeDraftStatus(message, tone = "info") {
 }
 
 const LIFE_RECOVERY_SESSION_KEY = "qzoneLifeDraftRecovery";
+const LIFE_PRE_ADMISSION_REJECTIONS = new Set([
+  "LIFE_INVALID_REQUEST", "LIFE_INVALID_OWNER", "LIFE_UNAVAILABLE", "LIFE_CLOSED",
+]);
 
 function invalidateLifeAssociation(message) {
   if (state.lifeAssociation) state.lifeAssociationInvalid = message || "该日常草稿已失效。";
@@ -2181,15 +2184,17 @@ async function renderLifeDraftPreviews(job) {
 
 async function refreshLifeDraft(jobId = "", { poll = false, recovery = false } = {}) {
   try {
-    const job = await apiGet("page/life-draft", jobId ? { id: jobId } : {});
+    const requestId = recovery ? String(state.lifeRecovery?.requestId || "") : "";
+    const job = await apiGet("page/life-draft", jobId ? { id: jobId } : (requestId ? { request_id: requestId } : {}));
     if (recovery && state.lifeRecovery) {
       const elapsed = Date.now() - Number(state.lifeRecovery.startedAt || Date.now());
       if (elapsed >= 15 * 60 * 1000) {
         state.lifeRecovery = null;
         state.lifeRecoveryExpired = true;
         saveLifeRecovery();
-      } else if (job?.state === "idle") {
-        setLifeDraftStatus("未找到已接收任务，正在仅查询最新状态；不会自动重新生成。", "warn");
+      } else if (!validLifeJob(job) || job.request_id !== requestId
+          || Number(job.account_uin) !== Number(state.status?.login?.uin || 0)) {
+        setLifeDraftStatus("该请求尚未关联到可验证任务；继续按请求编号查询，不会自动重新生成。", "warn");
       } else if (job?.state === "failed" || job?.state === "cancelled") {
         state.lifeRecovery = null;
         state.lifeRecoveryExpired = false;
@@ -2200,7 +2205,14 @@ async function refreshLifeDraft(jobId = "", { poll = false, recovery = false } =
         saveLifeRecovery();
       }
     }
-    state.lifeJob = job || { state: "idle" };
+    if (recovery && state.lifeRecovery && (!validLifeJob(job) || job.request_id !== requestId
+        || Number(job.account_uin) !== Number(state.status?.login?.uin || 0))) {
+      renderLifeDraft();
+      if (poll) scheduleLifePoll("", 3000);
+      return null;
+    }
+    state.lifeJob = validLifeJob(job) || (job?.state === "idle" && typeof job === "object")
+      ? job : { state: "idle" };
     if (state.lifeAssociation && (Number(job?.account_uin || 0) !== Number(state.lifeAssociation.accountUin) || String(job?.id || "") !== String(state.lifeAssociation.jobId))) {
       invalidateLifeAssociation("原日常草稿无法在当前账号/查询结果中验证；不会作为普通内容发送。请明确清空后重新编辑。");
     } else if (state.lifeAssociation && job?.publish_state === "published") {
@@ -2231,6 +2243,12 @@ async function refreshLifeDraft(jobId = "", { poll = false, recovery = false } =
   }
 }
 
+function validLifeJob(job) {
+  return Boolean(job && typeof job === "object" && typeof job.id === "string" && job.id
+    && Number.isFinite(Number(job.account_uin)) && Number(job.account_uin) > 0
+    && ["running", "succeeded", "failed", "cancelled"].includes(job.state));
+}
+
 async function startLifeDraft() {
   if (state.lifeRecovery) {
     await refreshLifeDraft("", { poll: true, recovery: true });
@@ -2244,6 +2262,12 @@ async function startLifeDraft() {
   const requestId = state.lifeRequestId;
   try {
     const job = await apiPost("page/life-draft", { action: "generate_draft", request_id: requestId });
+    if (!validLifeJob(job) || job.request_id !== requestId
+        || Number(job.account_uin) !== Number(state.status?.login?.uin || 0)) {
+      const error = new Error("任务响应尚未通过身份和请求编号校验");
+      error.code = "LIFE_RESPONSE_UNVERIFIED";
+      throw error;
+    }
     state.lifeRecovery = null;
     state.lifeRecoveryExpired = false;
     saveLifeRecovery();
@@ -2251,6 +2275,13 @@ async function startLifeDraft() {
     renderLifeDraft();
     if (job?.state === "running") scheduleLifePoll(job.id);
   } catch (error) {
+    if (LIFE_PRE_ADMISSION_REJECTIONS.has(String(error?.code || ""))) {
+      state.lifeRecovery = null;
+      state.lifeRecoveryExpired = false;
+      saveLifeRecovery();
+      setLifeDraftStatus(error.message || "日常草稿请求未受理。", "warn");
+      return;
+    }
     state.lifeRecovery = { requestId, startedAt: Date.now() };
     state.lifeRecoveryExpired = false;
     saveLifeRecovery();
@@ -2618,9 +2649,10 @@ async function publishCapturedPayload(body, { lifeAssociation = null, composerRe
     setNotice("说说已发布。", "success");
   } catch (error) {
     if (lifeAssociation) {
-      lifeAssociation.uncertain = true;
-      lifeAssociation.publishState = "unknown";
-      if (state.lifeJob?.id === lifeAssociation.jobId) state.lifeJob.publish_state = "unknown";
+      const confirmedNotSent = error?.code === "LIFE_PRE_DISPATCH";
+      lifeAssociation.uncertain = !confirmedNotSent;
+      lifeAssociation.publishState = confirmedNotSent ? "ready" : "unknown";
+      if (state.lifeJob?.id === lifeAssociation.jobId) state.lifeJob.publish_state = lifeAssociation.publishState;
       await refreshLifeDraft(lifeAssociation.jobId);
     }
     setNotice(error.message || "发布失败", "error");

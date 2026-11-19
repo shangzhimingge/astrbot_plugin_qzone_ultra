@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import random
+import secrets
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -85,7 +86,7 @@ class AutoReplyService:
         rng: Any = random,
     ):
         self.controller = controller
-        self.store = AtomicItemStoreFile(Path(state_path))
+        self.store = AtomicItemStoreFile(Path(state_path), strict=True)
         self.config = config
         self.generate_reply = generate_reply
         self.reply_lock = reply_lock or asyncio.Lock()
@@ -119,22 +120,34 @@ class AutoReplyService:
     async def _state(self) -> dict[str, Any]:
         payload = await self.store.read_async()
         for item in payload.get("items", []):
-            if isinstance(item, dict) and item.get("key") == self.META_KEY and isinstance(item.get("state"), dict):
-                return item["state"]
+            if isinstance(item, dict) and item.get("key") == self.META_KEY:
+                state = item.get("state")
+                if not isinstance(state, dict) or not isinstance(state.get("accounts"), dict):
+                    raise ValueError("auto-reply state schema is invalid")
+                for account in state["accounts"].values():
+                    if not isinstance(account, dict) or ("records" in account and not isinstance(account["records"], dict)):
+                        raise ValueError("auto-reply account schema is invalid")
+                return state
         return {"accounts": {}}
 
     async def _mutate_state(self, updater: Callable[[dict[str, Any]], Any]) -> Any:
         def mutate(payload: dict[str, Any]) -> Any:
-            items = payload.setdefault("items", [])
-            entry = next((item for item in items if isinstance(item, dict) and item.get("key") == self.META_KEY), None)
+            items = payload.get("items")
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                raise ValueError("auto-reply store schema is invalid")
+            entry = next((item for item in items if item.get("key") == self.META_KEY), None)
             if entry is None:
                 entry = {"key": self.META_KEY, "state": {"accounts": {}}}
                 items.append(entry)
-            if not isinstance(entry.get("state"), dict):
-                entry["state"] = {"accounts": {}}
-            state = entry["state"]
-            if not isinstance(state.get("accounts"), dict):
-                state["accounts"] = {}
+            state = entry.get("state")
+            if not isinstance(state, dict) or not isinstance(state.get("accounts"), dict):
+                raise ValueError("auto-reply state schema is invalid")
+            for account in state["accounts"].values():
+                if not isinstance(account, dict) or ("records" in account and not isinstance(account["records"], dict)):
+                    raise ValueError("auto-reply account schema is invalid")
+                records = account.get("records", {})
+                if any(not isinstance(value, dict) for value in records.values()):
+                    raise ValueError("auto-reply record schema is invalid")
             return updater(state)
         return await self.store.transact_async(mutate)
 
@@ -274,37 +287,109 @@ class AutoReplyService:
     def _has_bot_reply(comments: list[QzoneComment], target: QzoneComment, login: int) -> bool:
         return any(item.parent_id == target.commentid and item.uin == login for item in comments)
 
-    async def _reserve(self, login: int, key: str, today: str) -> bool:
+    async def _admit_generation(self, login: int, key: str, today: str, token: str) -> str:
+        def update(state: dict[str, Any]) -> str:
+            account = state["accounts"].setdefault(str(login), {})
+            records = account.setdefault("records", {})
+            existing = records.get(key)
+            if existing is not None:
+                if not isinstance(existing, dict):
+                    return "existing"
+                status = existing.get("status")
+                if status in {"baseline", "reserved", "uncertain", "complete", "skipped"}:
+                    return "existing"
+                if status != "generating":
+                    return "existing"
+                if existing.get("day") == today:
+                    return "existing"
+            used = sum(1 for value in records.values()
+                       if isinstance(value, dict) and value.get("day") == today
+                       and value.get("status") in {"generating", "reserved", "uncertain", "complete"})
+            if used >= self.config.daily_limit:
+                return "full"
+            records[key] = {"status": "generating", "day": today, "token": token,
+                            "updated_at": int(__import__("time").time())}
+            return "acquired"
+        transaction = asyncio.create_task(self._mutate_state(update))
+        try:
+            return str(await asyncio.shield(transaction))
+        except asyncio.CancelledError:
+            # transact_async may be running in a worker thread; settle it before
+            # releasing a claim it may have committed.
+            try:
+                result = str(await asyncio.shield(transaction))
+                if result == "acquired":
+                    await asyncio.shield(self._release_generation(login, key, token))
+            finally:
+                raise
+
+    async def _release_generation(self, login: int, key: str, token: str) -> None:
+        def update(state: dict[str, Any]) -> None:
+            account = state["accounts"].setdefault(str(login), {})
+            records = account.setdefault("records", {})
+            current = records.get(key)
+            if isinstance(current, dict) and current.get("status") == "generating" and current.get("token") == token:
+                records.pop(key, None)
+        await self._mutate_state(update)
+
+    async def _reserve(self, login: int, key: str, today: str, token: str = "") -> bool:
+        if not token:
+            token = secrets.token_urlsafe(20)
+            if await self._admit_generation(login, key, today, token) != "acquired":
+                return False
         def update(state: dict[str, Any]) -> bool:
             account = state["accounts"].setdefault(str(login), {})
             records = account.setdefault("records", {})
             existing = records.get(key)
-            if isinstance(existing, dict) and existing.get("status") in {"baseline", "reserved", "uncertain", "complete"}:
+            if (not isinstance(existing, dict) or existing.get("status") != "generating"
+                    or existing.get("token") != token):
                 return False
             used = sum(
                 1 for value in records.values()
                 if isinstance(value, dict) and value.get("day") == today
-                and value.get("status") in {"reserved", "uncertain", "complete"}
+                and value.get("status") in {"generating", "reserved", "uncertain", "complete"}
             )
-            if used >= self.config.daily_limit:
+            already_counted_for_today = existing.get("status") == "generating" and existing.get("day") == today
+            if used > self.config.daily_limit or (not already_counted_for_today and used >= self.config.daily_limit):
                 return False
-            records[key] = {"status": "reserved", "day": today, "updated_at": int(__import__("time").time())}
+            records[key] = {"status": "reserved", "day": today, "token": token,
+                            "updated_at": int(__import__("time").time())}
+            return True
+        transaction = asyncio.create_task(self._mutate_state(update))
+        try:
+            return bool(await asyncio.shield(transaction))
+        except asyncio.CancelledError:
+            try:
+                if await asyncio.shield(transaction):
+                    await asyncio.shield(self._release_reservation(login, key, token))
+            finally:
+                raise
+
+    async def _finish(self, login: int, key: str, status: str, token: str = "") -> bool:
+        def update(state: dict[str, Any]) -> bool:
+            records = state["accounts"].get(str(login), {}).get("records", {})
+            record = records.get(key)
+            if not token and status == "skipped" and record is None:
+                records[key] = {"status": "skipped", "day": "", "token": "",
+                                "updated_at": int(__import__("time").time())}
+                return True
+            if (not isinstance(record, dict) or record.get("token") != token
+                    or record.get("status") not in {"generating", "reserved"}):
+                return False
+            record.update({"status": status, "updated_at": int(__import__("time").time())})
             return True
         return bool(await self._mutate_state(update))
 
-    async def _finish(self, login: int, key: str, status: str) -> None:
-        def update(state: dict[str, Any]) -> None:
-            record = state["accounts"].setdefault(str(login), {}).setdefault("records", {}).setdefault(key, {})
-            record.update({"status": status, "updated_at": int(__import__("time").time())})
-        await self._mutate_state(update)
-
-    async def _release_reservation(self, login: int, key: str) -> None:
-        def update(state: dict[str, Any]) -> None:
-            records = state["accounts"].setdefault(str(login), {}).setdefault("records", {})
+    async def _release_reservation(self, login: int, key: str, token: str) -> bool:
+        def update(state: dict[str, Any]) -> bool:
+            records = state["accounts"].get(str(login), {}).get("records", {})
             record = records.get(key)
-            if isinstance(record, dict) and record.get("status") == "reserved":
+            if (isinstance(record, dict) and record.get("status") == "reserved"
+                    and record.get("token") == token):
                 records.pop(key, None)
-        await self._mutate_state(update)
+                return True
+            return False
+        return bool(await self._mutate_state(update))
 
     async def mark_manual_reply(self, login: int, hostuin: int, fid: str, commentid: str, comment_uin: int) -> bool:
         """Persist a successful manual reply so a stale detail snapshot cannot trigger auto-reply."""
@@ -317,7 +402,7 @@ class AutoReplyService:
             def update(state: dict[str, Any]) -> None:
                 account = state["accounts"].setdefault(str(login), {})
                 record = account.setdefault("records", {}).setdefault(key, {})
-                record.update({"status": "complete", "updated_at": int(__import__("time").time()), "source": "manual"})
+                record.update({"status": "complete", "updated_at": int(__import__("time").time()), "source": "manual", "token": ""})
                 record.setdefault("day", "")
             await self._mutate_state(update)
         except Exception as exc:
@@ -346,7 +431,15 @@ class AutoReplyService:
                 post, comments = await self._fresh_post(entry)
                 for comment in comments:
                     key = self._identity(login, entry, comment)
-                    if key in records or key in self._manual_replied or self._skip_reason(comment, login, activation_ts):
+                    prior = records.get(key)
+                    # A crash can leave yesterday's pre-dispatch generation marker behind.
+                    # It consumes only yesterday's quota and must not block today's retry.
+                    stale_generation = (
+                        isinstance(prior, dict)
+                        and prior.get("status") == "generating"
+                        and prior.get("day") != date.today().isoformat()
+                    )
+                    if (key in records and not stale_generation) or key in self._manual_replied or self._skip_reason(comment, login, activation_ts):
                         continue
                     if self.rng.random() >= self.config.reply_probability:
                         await self._finish(login, key, "skipped")
@@ -355,43 +448,66 @@ class AutoReplyService:
                         return handled
                     if self.config.delay_max:
                         await asyncio.sleep(self.rng.uniform(self.config.delay_min, self.config.delay_max))
+                    generation_token = __import__("secrets").token_urlsafe(20)
+                    admission = await self._admit_generation(login, key, date.today().isoformat(), generation_token)
+                    if admission == "full":
+                        return handled
+                    if admission != "acquired":
+                        continue
+                    attempts += 1
                     try:
                         text = str(await self.generate_reply(post, comment) or "").strip()
                     except asyncio.CancelledError:
+                        await asyncio.shield(self._release_generation(login, key, generation_token))
                         raise
                     except Exception:
+                        await self._release_generation(login, key, generation_token)
                         continue  # LLM errors remain retryable.
                     if not text:
+                        await self._release_generation(login, key, generation_token)
                         continue
-                    async with self.reply_lock:
-                        fresh_post, fresh_comments = await self._fresh_post(entry)
+                    try:
+                        await self.reply_lock.acquire()
+                    except asyncio.CancelledError:
+                        await asyncio.shield(self._release_generation(login, key, generation_token))
+                        raise
+                    try:
+                        try:
+                            fresh_post, fresh_comments = await self._fresh_post(entry)
+                        except asyncio.CancelledError:
+                            await asyncio.shield(self._release_generation(login, key, generation_token))
+                            raise
+                        except Exception:
+                            await self._release_generation(login, key, generation_token)
+                            raise
                         fresh_target = next(
                             (item for item in fresh_comments if item.commentid == comment.commentid and item.uin == comment.uin and not item.parent_id),
                             None,
                         )
                         if fresh_target is None or self._has_bot_reply(fresh_comments, fresh_target, login):
-                            await self._finish(login, key, "complete")
+                            await self._finish(login, key, "complete", generation_token)
                             continue
                         if key in self._manual_replied:
+                            await self._release_generation(login, key, generation_token)
                             continue
                         # A delay or slow LLM can cross the local midnight boundary.
-                        if not await self._reserve(login, key, date.today().isoformat()):
+                        if not await self._reserve(login, key, date.today().isoformat(), generation_token):
+                            await self._release_generation(login, key, generation_token)
                             continue
                         try:
                             latest_status = await asyncio.wait_for(
                                 self.controller.get_status(probe_daemon=False), timeout=15
                             )
                         except asyncio.CancelledError:
-                            await asyncio.shield(self._release_reservation(login, key))
+                            await asyncio.shield(self._release_reservation(login, key, generation_token))
                             raise
                         except Exception:
-                            await self._release_reservation(login, key)
+                            await self._release_reservation(login, key, generation_token)
                             raise
                         latest_login = int(latest_status.get("login_uin") or latest_status.get("uin") or 0) if isinstance(latest_status, dict) else 0
                         if not isinstance(latest_status, dict) or latest_login != login or latest_status.get("needs_rebind"):
-                            await self._release_reservation(login, key)
+                            await self._release_reservation(login, key, generation_token)
                             return handled
-                        attempts += 1
                         try:
                             await self.controller.reply_comment(
                                 hostuin=entry.hostuin,
@@ -400,13 +516,17 @@ class AutoReplyService:
                                 comment_uin=fresh_target.uin,
                                 content=text,
                                 appid=entry.appid,
+                                expected_login_uin=login,
+                                retry_writes=False,
                             )
                         except asyncio.CancelledError:
-                            await asyncio.shield(self._finish(login, key, "uncertain"))
+                            await asyncio.shield(self._finish(login, key, "uncertain", generation_token))
                             raise
                         except Exception:
-                            await self._finish(login, key, "uncertain")
+                            await self._finish(login, key, "uncertain", generation_token)
                             continue
-                        await self._finish(login, key, "complete")
+                        await self._finish(login, key, "complete", generation_token)
                         handled += 1
+                    finally:
+                        self.reply_lock.release()
             return handled

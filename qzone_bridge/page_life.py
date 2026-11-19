@@ -245,6 +245,17 @@ class PageLifeJobStore:
                 raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，请刷新页面后重试。")
             return job
 
+    async def get_by_request(self, request_id: str, account_uin: int) -> PageLifeJob | None:
+        async with self._lock:
+            self._prune_locked(self._clock())
+            job_id = self._request_to_job.get(str(request_id or ""))
+            job = self._jobs.get(job_id or "")
+            if job is None:
+                return None
+            if job.account_uin != account_uin:
+                raise PageLifeError("LIFE_ACCOUNT_CHANGED", "登录账号已变化，请刷新页面后重试。")
+            return job
+
     async def set_phase(self, job_id: str, phase: str) -> bool:
         if phase not in PAGE_LIFE_PHASES:
             return False
@@ -385,6 +396,16 @@ class PageLifeJobStore:
             job.updated_at = self._clock()
             job.completed_at = job.updated_at
             self._prune_locked(job.updated_at)
+            return True
+
+    async def release_publish(self, job_id: str, digest: str) -> bool:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.publish_state != "sending" or job.publish_digest != digest:
+                return False
+            job.publish_state = "ready"
+            job.publish_digest = ""
+            job.updated_at = self._clock()
             return True
 
     async def mark_unknown(self, job_id: str, *, diagnostic: dict[str, Any] | None = None) -> None:
